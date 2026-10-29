@@ -39,8 +39,6 @@ poker-ai-arena/
 │   ├── conftest.py                 # puts src/ on sys.path for pytest
 │   ├── test_environment.py         # Stage 1 contract tests
 │   └── test_history.py             # history-encoding tests
-├── notebooks/
-│   └── 01_poker_environment.ipynb  # earlier exploration, kept for reference
 ├── .venv/                          # local environment (git-ignored)
 ├── .gitignore
 ├── pytest.ini                      # limits collection to tests/
@@ -48,8 +46,10 @@ poker-ai-arena/
 └── README.md
 ```
 
-The notebook and the empty pre-existing `tets_poker/` folder are preserved but
-are not part of the maintained workflow. The maintained code is plain Python.
+The maintained workflow is plain Python modules, scripts and pytest files — there
+are no notebooks. An early exploratory notebook was removed from the repository;
+it is still recoverable from commit `f8a4a0a` if ever needed. The empty
+pre-existing `tets_poker/` folder is left on disk but is not tracked.
 
 ---
 

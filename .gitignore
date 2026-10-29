@@ -19,7 +19,7 @@ htmlcov/
 # Logs
 *.log
 
-# Jupyter (legacy notebook is kept, but its generated files are not)
+# Jupyter (not used here; ignore generated files anyway)
 .ipynb_checkpoints/
 *.nbconvert.ipynb
 
