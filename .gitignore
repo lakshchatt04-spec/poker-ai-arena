@@ -1,0 +1,43 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test and tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+
+# Jupyter (legacy notebook is kept, but its generated files are not)
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# Model checkpoints, training runs and generated data
+models/
+checkpoints/
+runs/
+artifacts/
+data/
+*.pt
+*.pth
+*.pkl
+*.npz
+*.npy
+*.jsonl
+events.out.tfevents.*
+
+# OS / editor artifacts
+.DS_Store
+Thumbs.db
+.idea/
