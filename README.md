@@ -30,13 +30,16 @@ poker-ai-arena/
 ├── src/
 │   └── poker_arena/
 │       ├── __init__.py
+│       ├── encoding.py             # Agent A's 131-number state vector
 │       ├── environment.py          # Stage 1 inspection helpers
 │       └── history.py              # Agent B's betting-history tokens
 ├── scripts/
+│   ├── test_encoding.py            # executable encoder report
 │   ├── test_environment.py         # executable smoke test / report
 │   └── test_history.py             # executable history-encoding report
 ├── tests/
 │   ├── conftest.py                 # puts src/ on sys.path for pytest
+│   ├── test_encoding.py            # encoder tests
 │   ├── test_environment.py         # Stage 1 contract tests
 │   └── test_history.py             # history-encoding tests
 ├── .venv/                          # local environment (git-ignored)
@@ -91,6 +94,7 @@ From the project root, with the virtual environment activated:
 ```powershell
 python scripts\test_environment.py
 python scripts\test_history.py
+python scripts\test_encoding.py
 python -m pytest -q
 ```
 
@@ -99,12 +103,14 @@ Without activation:
 ```powershell
 .\.venv\Scripts\python.exe scripts\test_environment.py
 .\.venv\Scripts\python.exe scripts\test_history.py
+.\.venv\Scripts\python.exe scripts\test_encoding.py
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
 The environment smoke test ends with `All Stage 1 checks passed.`, the history
-smoke test with `All history-encoding checks passed.`, and the test suite
-currently reports `35 passed`.
+smoke test with `All history-encoding checks passed.`, the encoder report with
+`All observation-encoder checks passed.`, and the test suite currently reports
+`55 passed`.
 
 `pytest.ini` limits collection to `tests/` because
 `scripts/test_environment.py` and `tests/test_environment.py` share a filename
@@ -129,6 +135,61 @@ currently reports `35 passed`.
 produced, and then checks 200 random hands: token order matches
 `env.action_recorder`, masks are prefixes with no padding leaking through, all
 features stay in `[0, 1]`, and nothing exceeds the 32-token capacity.
+
+`scripts/test_encoding.py` prints Agent A's 131-number vector block by block for
+one hand, then checks 100 random hands: every value stays in `[0, 1]`, all four
+streets are visited, the legal mask matches the environment at every decision,
+and the pot feature reaches its ceiling.
+
+---
+
+## Agent A observation encoder
+
+`encoding.py` turns `state["raw_obs"]` into the single 131-number vector the
+policy/value MLP reads. Anything the network can ever know about a state is in
+this vector, so it is also the boundary of the comparison with Agent B: Agent B
+receives these same features plus the action tokens from `history.py`.
+
+| Index | Width | Feature | Why it is there |
+|---|---|---|---|
+| 0–51 | 52 | own hole cards, multi-hot | card identity without implying an order |
+| 52–103 | 52 | public cards, multi-hot | RLCard merges both into `obs[0:52]`, so holding A on a K-high board would look identical to holding K on an A-high board |
+| 104–123 | 20 | 4 streets × 5 raise slots | already in the observation; kept one-hot so no ordering is pre-committed |
+| 124–127 | 4 | street one-hot | recoverable from the board size, but stating it explicitly is 4 dims |
+| 128 | 1 | pot ÷ 48 bb | absent from the observation |
+| 129 | 1 | chips to call ÷ 2 bb | absent from the observation |
+| 130 | 1 | posted the small blind | RLCard randomises the blinds every hand |
+
+All values are in `[0, 1]` and `float32`. The two ceilings are measured rather
+than guessed: `pot` reaches 48 bb and `to_call` reaches 2 bb under the 4-raise
+cap. `ObservationEncoder.from_environment(env)` checks those betting parameters
+and refuses to build the encoder if they change, because a silently saturated
+feature is worse than a failed start.
+
+```python
+encoder = ObservationEncoder.from_environment(env)
+
+state, player_id = env.reset()
+small_blind = small_blind_player(state)          # once per hand
+small = player_id == small_blind
+
+while not env.is_over():
+    encoded = encoder.encode(state, is_small_blind=small)
+    logits = policy(encoded.features)            # (131,) -> (4,)
+    logits[~encoded.legal_mask] = -1e9           # exactly 0 probability
+    ...
+```
+
+The legal-action mask comes back alongside the features and is **applied to the
+logits, never fed in as an input**. Enforcing it at the output is exact; teaching
+the network to respect it from a feature is not. The mask is copied from
+`state["legal_actions"]`, so the encoder cannot disagree with RLCard about what
+is legal.
+
+`small_blind_player()` must be called on the state from `reset()`, because the
+blind postings are the only moment the chip contributions identify the seats. It
+raises if handed a mid-hand state, where the chips are already level or
+re-raised.
 
 ---
 
@@ -265,15 +326,20 @@ otherwise recover at the first decision of a hand.
    `history_raise_nums`. It keeps changing after the decision, so copy it
    (`list(...)`) before storing it. `HistoryTracker` reads it immediately, so
    tokens always carry the count that was true at decision time.
+8. **`raw_obs` holds card *strings*; `obs` holds slot *numbers*.**
+   `raw_obs["hand"]` is `['SQ', 'C7']` while `obs[0:52]` is a 52-slot array, and
+   `env.card2index` is the only mapping between them. Code that assumes
+   `raw_obs` already contains slot indices fails with
+   `invalid literal for int(): 'SQ'`. `ObservationEncoder` captures
+   `env.card2index` once for this reason.
 
 ---
 
 ## Current limitations
 
 * No learned agents, PPO, GRU, self-play or opponent modelling.
-* No observation encoder for the 72-dimensional vector beyond
-  `decode_observation()`; Agent B's history tokens exist, but nothing consumes
-  them yet.
+* The observation encoder exists (`encoding.py`, 131 numbers) but nothing
+  consumes it yet; Agent B's history tokens are also encoded and unused.
 * No training loop, checkpointing or evaluation harness.
 * The smoke test uses uniformly random agents, not competent baselines.
 * Only heads-up **limit** Hold'em is set up; No-Limit is deliberately not used.
@@ -286,19 +352,18 @@ otherwise recover at the first decision of a hand.
 | Stage | Work | Status |
 |---|---|---|
 | 1 | Verify simulator; document observations, actions, payoffs and history; encode Agent B's tokens | ✅ done |
-| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **next** |
+| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **in progress — encoder done** |
 | 3 | Agent B: MLP + GRU over betting history, trained with PPO | planned |
 | 4 | Head-to-head evaluation, ablations and results write-up | planned |
 
-**Recommended next milestone: implement Agent A.**
+**Recommended next milestone: the policy/value network.**
 
-A sensible Stage 2 scope:
+A sensible remaining Stage 2 scope:
 
-1. Build an observation encoder from the 72-dimensional RLCard vector plus
-   scalar features such as pot size, chips committed and street.
-2. Build the legal-action mask and validate it against `state["legal_actions"]`.
-3. Implement a small PyTorch MLP policy/value network and a PPO training loop
-   against a random or simple rule-based opponent.
+1. ~~Build the observation encoder: 131 numbers, masking, bounds checked.~~ ✅
+2. Build the policy/value MLP (shared 256×2 trunk, `256→4` and `256→1` heads)
+   and the legal-action masking at the output.
+3. Implement a PPO training loop against a random or simple rule-based opponent.
 4. Add deterministic seeding, checkpointing and a fixed-seed evaluation
    harness with confidence intervals. The observed per-hand standard deviation
    is roughly 2.3–2.6 big blinds, so an edge of 0.05 bb needs thousands of hands
