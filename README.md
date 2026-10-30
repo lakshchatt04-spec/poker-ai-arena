@@ -32,16 +32,19 @@ poker-ai-arena/
 │       ├── __init__.py
 │       ├── encoding.py             # Agent A's 131-number state vector
 │       ├── environment.py          # Stage 1 inspection helpers
-│       └── history.py              # Agent B's betting-history tokens
+│       ├── history.py              # Agent B's betting-history tokens
+│       └── networks.py             # Agent A's policy/value MLP
 ├── scripts/
 │   ├── test_encoding.py            # executable encoder report
 │   ├── test_environment.py         # executable smoke test / report
-│   └── test_history.py             # executable history-encoding report
+│   ├── test_history.py             # executable history-encoding report
+│   └── test_networks.py            # executable network report
 ├── tests/
 │   ├── conftest.py                 # puts src/ on sys.path for pytest
 │   ├── test_encoding.py            # encoder tests
 │   ├── test_environment.py         # Stage 1 contract tests
-│   └── test_history.py             # history-encoding tests
+│   ├── test_history.py             # history-encoding tests
+│   └── test_networks.py            # network tests
 ├── .venv/                          # local environment (git-ignored)
 ├── .gitignore
 ├── pytest.ini                      # limits collection to tests/
@@ -95,6 +98,7 @@ From the project root, with the virtual environment activated:
 python scripts\test_environment.py
 python scripts\test_history.py
 python scripts\test_encoding.py
+python scripts\test_networks.py
 python -m pytest -q
 ```
 
@@ -104,13 +108,14 @@ Without activation:
 .\.venv\Scripts\python.exe scripts\test_environment.py
 .\.venv\Scripts\python.exe scripts\test_history.py
 .\.venv\Scripts\python.exe scripts\test_encoding.py
+.\.venv\Scripts\python.exe scripts\test_networks.py
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
 The environment smoke test ends with `All Stage 1 checks passed.`, the history
 smoke test with `All history-encoding checks passed.`, the encoder report with
-`All observation-encoder checks passed.`, and the test suite currently reports
-`55 passed`.
+`All observation-encoder checks passed.`, the network report with
+`All network checks passed.`, and the test suite currently reports `72 passed`.
 
 `pytest.ini` limits collection to `tests/` because
 `scripts/test_environment.py` and `tests/test_environment.py` share a filename
@@ -168,6 +173,7 @@ feature is worse than a failed start.
 
 ```python
 encoder = ObservationEncoder.from_environment(env)
+net = PolicyValueNet()
 
 state, player_id = env.reset()
 small_blind = small_blind_player(state)          # once per hand
@@ -175,8 +181,11 @@ small = player_id == small_blind
 
 while not env.is_over():
     encoded = encoder.encode(state, is_small_blind=small)
-    logits = policy(encoded.features)            # (131,) -> (4,)
-    logits[~encoded.legal_mask] = -1e9           # exactly 0 probability
+    logits, value = net(
+        torch.from_numpy(encoded.features).unsqueeze(0),   # (1, 131)
+        torch.from_numpy(encoded.legal_mask).unsqueeze(0),  # (1, 4)
+    )                                                   # (1, 4), (1,)
+    action = Categorical(logits=logits).sample()
     ...
 ```
 
@@ -184,12 +193,83 @@ The legal-action mask comes back alongside the features and is **applied to the
 logits, never fed in as an input**. Enforcing it at the output is exact; teaching
 the network to respect it from a feature is not. The mask is copied from
 `state["legal_actions"]`, so the encoder cannot disagree with RLCard about what
-is legal.
+is legal, and `PolicyValueNet.forward` applies it before the logits leave the
+module.
 
 `small_blind_player()` must be called on the state from `reset()`, because the
 blind postings are the only moment the chip contributions identify the seats. It
 raises if handed a mid-hand state, where the chips are already level or
 re-raised.
+
+---
+
+## Agent A policy/value network
+
+`networks.py` holds one `nn.Module`: a shared trunk that reads the 131 numbers
+and two heads that read the trunk.
+
+| Part | Shape | Parameters |
+|---|---|---|
+| trunk | `131 → 256 → 256`, ReLU | 99,584 |
+| policy head | `256 → 4`, no softmax | 1,028 |
+| value head | `256 → 1` | 257 |
+| **total** | | **100,869** |
+
+Orthogonal initialisation: gain `√2` on the trunk, **0.01** on the policy head,
+1.0 on the value head. The small policy gain keeps the first policy close to
+uniform instead of committing to one action on random weights.
+
+```python
+net = PolicyValueNet()
+logits, value = net(features, legal_mask)   # (B, 4) masked, (B,)
+
+dist = torch.distributions.Categorical(logits=logits)
+action = dist.sample()
+log_prob = dist.log_prob(action)            # what PPO needs
+```
+
+The module returns **logits, not probabilities**, because PPO wants `log_prob`
+and `entropy`, and `log_softmax` is more numerically stable than `log(probs)`.
+It does not sample, compute a loss or keep bookkeeping — that is the rollout's
+job.
+
+### The mask lives inside `forward`
+
+`legal_mask` is a required argument. There is no unmasked path, because the
+alternative fails silently in three separate places. RLCard **substitutes** an
+illegal action instead of rejecting it (`envs/limitholdem.py:90-96`: play
+`check` if possible, otherwise `fold`). Measured on an untrained network, at a
+state where the raise cap is reached and the only legal actions are call and
+fold:
+
+```text
+unmasked probabilities : call 0.250  raise 0.250  fold 0.250  check 0.250
+unmasked draws of raise: 2508 / 10000
+environment executed   : 'fold'      <- not an error, a substitution
+masked draws of raise  : 0 / 10000
+```
+
+So a policy that thinks it is raising **folds the hand**. And if the update
+remembers the mask while sampling forgot it, the stored log-probability belongs
+to an action that never happened: the ratio
+`exp(logπ_new(raise) − logπ_old(raise))` becomes `exp(−1e9 + 1.3)`, which
+underflows to exactly `0`. The sample then contributes nothing — no NaN, no
+warning — so exactly the rarest cap states are quietly dropped from training.
+
+Illegal logits become `-1e9`, not `-inf`. Both give probability exactly `0` and
+both leave the chosen action's log-probability untouched, but `-inf` makes the
+entropy `0 × -inf = NaN`, and one NaN poisons every gradient in the batch.
+
+Consequences the tests pin down: probabilities of illegal actions are exactly
+`0.0`, 10,000 samples from a capped state never return `raise`, the gradient at a
+masked logit is exactly `0.0` while the shared trunk still receives gradient, and
+the value head is unaffected by the mask. A mask row with no legal action raises
+instead of turning every logit into `-1e9` and silently producing a uniform
+distribution.
+
+`scripts/test_networks.py` prints the architecture, one real forward pass, the
+masked-vs-unmasked comparison above, and per-layer gradient magnitudes for one
+PPO-style loss.
 
 ---
 
@@ -310,9 +390,12 @@ otherwise recover at the first decision of a hand.
    `env.action_recorder`. A rollout buffer that stores states without copying the
    history will later see the history of the whole hand. Copy it with
    `list(state["action_record"])`.
-2. **Illegal actions are silently substituted.** `env.step()` returns `check`
-   when possible, otherwise `fold`, instead of raising. Future policies must
-   apply the legal-action mask (`action_mask()` is provided for this).
+2. **Illegal actions are silently substituted — and the fallback is `fold`.**
+   `envs/limitholdem.py:90-96` plays `check` if it is legal, otherwise `fold`,
+   instead of raising. At the raise cap `check` is not legal, so a policy that
+   samples an illegal `raise` *folds the hand* and the buffer records a raise.
+   Measured on an untrained network: 25% of cap-state samples hit this.
+   `PolicyValueNet` therefore applies the legal-action mask inside `forward`.
 3. **The environment seed only controls the dealer.** `RandomAgent` draws from
    NumPy's global RNG, so reproducible random play also needs `np.random.seed()`
    or an explicit `np.random.Generator`.
@@ -338,9 +421,9 @@ otherwise recover at the first decision of a hand.
 ## Current limitations
 
 * No learned agents, PPO, GRU, self-play or opponent modelling.
-* The observation encoder exists (`encoding.py`, 131 numbers) but nothing
-  consumes it yet; Agent B's history tokens are also encoded and unused.
-* No training loop, checkpointing or evaluation harness.
+* The encoder and the policy/value network exist, but nothing connects them to a
+  training loop yet; Agent B's history tokens are also encoded and unused.
+* No rollout collection, PPO update, checkpointing or evaluation harness.
 * The smoke test uses uniformly random agents, not competent baselines.
 * Only heads-up **limit** Hold'em is set up; No-Limit is deliberately not used.
 * No GUI, online play or real-money connection.
@@ -352,21 +435,26 @@ otherwise recover at the first decision of a hand.
 | Stage | Work | Status |
 |---|---|---|
 | 1 | Verify simulator; document observations, actions, payoffs and history; encode Agent B's tokens | ✅ done |
-| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **in progress — encoder done** |
+| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **in progress — encoder + network done** |
 | 3 | Agent B: MLP + GRU over betting history, trained with PPO | planned |
 | 4 | Head-to-head evaluation, ablations and results write-up | planned |
 
-**Recommended next milestone: the policy/value network.**
+**Recommended next milestone: rollout collection and the PPO update.**
 
 A sensible remaining Stage 2 scope:
 
 1. ~~Build the observation encoder: 131 numbers, masking, bounds checked.~~ ✅
-2. Build the policy/value MLP (shared 256×2 trunk, `256→4` and `256→1` heads)
-   and the legal-action masking at the output.
-3. Implement a PPO training loop against a random or simple rule-based opponent.
-4. Add deterministic seeding, checkpointing and a fixed-seed evaluation
-   harness with confidence intervals. The observed per-hand standard deviation
-   is roughly 2.3–2.6 big blinds, so an edge of 0.05 bb needs thousands of hands
-   before it is statistically meaningful.
-5. Only after Agent A is stable, add the GRU history encoder for Agent B and
+2. ~~Build the policy/value MLP (shared 256×2 trunk, `256→4` and `256→1`
+   heads) with the legal-action mask applied inside `forward`.~~ ✅
+3. Collect rollouts: play hands against a fixed opponent, storing encoded states,
+   sampled actions, their log-probabilities, values and per-decision rewards.
+4. Implement the PPO update: clipped ratio, entropy bonus, value-loss
+   coefficient ≈ 0.5, advantage and return normalisation, global gradient-norm
+   clipping.
+5. Add deterministic seeding, checkpointing (the network already round-trips
+   through `state_dict`) and a fixed-seed evaluation harness with confidence
+   intervals. The observed per-hand standard deviation is roughly 2.3–2.6 big
+   blinds, so an edge of 0.05 bb needs thousands of hands before it is
+   statistically meaningful.
+6. Only after Agent A is stable, add the GRU history encoder for Agent B and
    compare the two under the same evaluation protocol.

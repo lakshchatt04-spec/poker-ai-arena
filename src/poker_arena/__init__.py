@@ -2,8 +2,8 @@
 
 Stage 1 exposes simulator-inspection helpers plus the fixed-size betting-history
 encoding Agent B's GRU will read.  Stage 2 adds Agent A's 131-number observation
-encoder.  Learning agents, PPO and the networks themselves are not implemented
-yet.
+encoder and its policy/value network.  PPO and the training loop are not
+implemented yet.
 """
 
 from .encoding import (
@@ -42,12 +42,19 @@ from .history import (
     normalize,
     street_from_board_size,
 )
+from .networks import (
+    HIDDEN_WIDTH,
+    MASKED_LOGIT,
+    PolicyValueNet,
+)
 
 __all__ = [
     "ACTION_NAMES",
     "CARD_SLOT_COUNT",
     "ENVIRONMENT_ID",
     "FEATURE_DIM",
+    "HIDDEN_WIDTH",
+    "MASKED_LOGIT",
     "MAX_HISTORY_TOKENS",
     "NUM_BETTING_ROUNDS",
     "NUM_PLAYERS",
@@ -63,6 +70,7 @@ __all__ = [
     "HistoryTracker",
     "ObservationEncoder",
     "ObservationView",
+    "PolicyValueNet",
     "StepRecord",
     "action_mask",
     "decode_observation",
