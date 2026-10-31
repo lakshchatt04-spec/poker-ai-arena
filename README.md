@@ -33,18 +33,21 @@ poker-ai-arena/
 │       ├── encoding.py             # Agent A's 131-number state vector
 │       ├── environment.py          # Stage 1 inspection helpers
 │       ├── history.py              # Agent B's betting-history tokens
-│       └── networks.py             # Agent A's policy/value MLP
+│       ├── networks.py             # Agent A's policy/value MLP
+│       └── rollout.py              # rollout buffer + GAE for the PPO update
 ├── scripts/
 │   ├── test_encoding.py            # executable encoder report
 │   ├── test_environment.py         # executable smoke test / report
 │   ├── test_history.py             # executable history-encoding report
-│   └── test_networks.py            # executable network report
+│   ├── test_networks.py            # executable network report
+│   └── test_rollout.py             # executable rollout / GAE report
 ├── tests/
 │   ├── conftest.py                 # puts src/ on sys.path for pytest
 │   ├── test_encoding.py            # encoder tests
 │   ├── test_environment.py         # Stage 1 contract tests
 │   ├── test_history.py             # history-encoding tests
-│   └── test_networks.py            # network tests
+│   ├── test_networks.py            # network tests
+│   └── test_rollout.py             # rollout and GAE tests
 ├── .venv/                          # local environment (git-ignored)
 ├── .gitignore
 ├── pytest.ini                      # limits collection to tests/
@@ -85,8 +88,9 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
 
 Verified with Python 3.14.6, `rlcard` 1.2.0, `numpy` 2.5.4, `pytest` 9.2.0,
-`torch` 2.15.0 and `matplotlib` 3.11.2. Only `rlcard`, `numpy` and `pytest` are
-imported by Stage 1; `torch` and `matplotlib` are installed for later stages.
+`torch` 2.15.0 and `matplotlib` 3.11.2. Stage 1 imports only `rlcard`, `numpy`
+and `pytest`; Agent A's encoder, network and rollout modules add `torch`.
+`matplotlib` is installed for later plots.
 
 ---
 
@@ -99,6 +103,7 @@ python scripts\test_environment.py
 python scripts\test_history.py
 python scripts\test_encoding.py
 python scripts\test_networks.py
+python scripts\test_rollout.py
 python -m pytest -q
 ```
 
@@ -109,13 +114,15 @@ Without activation:
 .\.venv\Scripts\python.exe scripts\test_history.py
 .\.venv\Scripts\python.exe scripts\test_encoding.py
 .\.venv\Scripts\python.exe scripts\test_networks.py
+.\.venv\Scripts\python.exe scripts\test_rollout.py
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
 The environment smoke test ends with `All Stage 1 checks passed.`, the history
 smoke test with `All history-encoding checks passed.`, the encoder report with
 `All observation-encoder checks passed.`, the network report with
-`All network checks passed.`, and the test suite currently reports `72 passed`.
+`All network checks passed.`, the rollout report with
+`All rollout checks passed.`, and the test suite currently reports `102 passed`.
 
 `pytest.ini` limits collection to `tests/` because
 `scripts/test_environment.py` and `tests/test_environment.py` share a filename
@@ -273,6 +280,127 @@ PPO-style loss.
 
 ---
 
+## Rollout collection and credit assignment
+
+A poker hand pays out once. Every decision inside the hand receives reward `0`
+and the hand's payoff arrives after the last action. The obvious rollout gives
+every decision the same terminal number and subtracts its baseline:
+
+```text
+A_t = R - V(s_t)
+```
+
+On a three-decision hand that loses 3 bb, with `V` rising because the board
+helped:
+
+```text
+ t  decision                       V(s_t)    R - V
+ 0  preflop call (value rose)        0.00    -3.00
+ 1  flop check  (value rose)         1.00    -4.00
+ 2  river fold  (value collapsed)    1.50    -4.50
+```
+
+Every decision is punished, including the two that **raised** the value
+estimate. Trained on this, the agent learns to stop calling and to stop checking
+when it improves — the opposite of the truth.
+
+`rollout.py` assigns credit with temporal-difference residuals instead:
+
+```text
+delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)
+A_t     = delta_t + (gamma * lambda) * A_{t+1}
+```
+
+`delta_t` asks "did the state get better or worse than the value head expected?",
+which each decision can answer on its own:
+
+```text
+ t  decision                       V(s_t)   delta    lam=0   lam=.95   lam=1
+ 0  preflop call (value rose)        0.00    1.00     1.00     -2.59   -3.00
+ 1  flop check  (value rose)         1.00    0.50     0.50     -3.78   -4.00
+ 2  river fold  (value collapsed)    1.50   -4.50    -4.50     -4.50   -4.50
+```
+
+`lambda = 1` reproduces `R - V(s_t)` **exactly** (the test asserts the identity),
+and `lambda = 0` blames only the transition that moved the value. `gamma = 1.0`
+because chips do not decay and the objective is the undiscounted expected payoff.
+
+The table is also the honest caveat: over a four-decision hand the terminal
+shock still reaches the first decision with weight `0.95³ ≈ 0.86`, so `0.95`
+sits much closer to the naive version than the intuition suggests. `0.95` is a
+reasonable starting point, not a solved choice; the PPO step will report the
+advantages it actually sees.
+
+There is no version of this that adds information. Rewarding pot growth teaches
+the agent to put chips in and never fold, and the only per-decision shaping that
+provably preserves the optimal policy is potential-based; with `phi = V` it
+reduces to the TD residual above.
+
+### What is stored
+
+One trajectory **per recorded player per hand**, because `V(s)` is from the
+acting player's point of view. In self-play both seats are recorded and their
+payoffs are `+R` and `-R`.
+
+```python
+@dataclass(frozen=True)
+class Transition:
+    features: np.ndarray    # (131,) float32, from the encoder
+    legal_mask: np.ndarray  # (4,) bool, copied at decision time
+    action: int
+    log_prob: float         # read from the same forward pass that sampled
+    value: float            # same forward pass
+
+@dataclass(frozen=True)
+class Trajectory:
+    transitions: tuple[Transition, ...]
+    final_payoff: float     # big blinds, this player's perspective
+```
+
+`log_prob` and `value` are captured at sampling time on purpose. Recomputing
+them with updated weights makes the PPO ratio meaningless.
+
+```python
+trajectories = collect_trajectories(env, encoder, net, hands=25, rng=seeded)
+buffer = RolloutBuffer()
+for trajectory in trajectories:
+    buffer.add_trajectory(trajectory)
+batch = buffer.batch()          # (N, 131), (N, 4), (N,)
+normalised = normalize_advantages(batch.advantages)   # inside the PPO step
+```
+
+`opponent=None` means self-play and records both seats; passing a callable
+`(state, player_id) -> action_id` makes it play player 1, so only player 0 (the
+learner) is recorded. A hand where the small blind folds preflop leaves the big
+blind with zero decisions; those are dropped rather than stacked, because GAE
+over zero steps is `0/0` and one empty row would poison the batch.
+
+`RolloutBuffer.batch()` returns **raw** advantages. Normalising here would
+silently break `returns == advantages + values`; the PPO step normalises a copy
+after computing both.
+
+### What the tests pin down
+
+`tests/test_rollout.py` (30 tests) asserts the `lambda = 1` identity, the
+`lambda = 0` residual, both columns of the worked example, `returns ==
+advantages + values` for every `lambda`, that the terminal transition
+bootstraps from `0` (a losing last decision cannot inherit a phantom
+continuation value), that an over-optimistic value estimate is corrected by the
+payoff, normalisation to mean `0` / std `1`, zeros instead of a division by zero
+on a flat batch, buffer stacking order and dtypes, rejection of bad widths,
+non-finite scalars, illegal stored actions and empty trajectories, that stored
+log-probabilities reproduce a fresh forward pass, that collected actions are
+legal, that self-play payoffs are zero-sum and equal `env.get_payoffs()`, that a
+callable opponent only ever plays player 1, and that the same seeds reproduce
+identical rollouts.
+
+`scripts/test_rollout.py` prints the tables above, one real hand decision by
+decision, and a 25-hand batch summary. A representative batch: 47 trajectories,
+82 decisions, zero illegal stored actions, raw advantage std `4.30` bb — one
+argument for normalising before the update.
+
+---
+
 ## Verified simulator contract (RLCard 1.2.0)
 
 These facts were checked by running code, not copied from documentation.
@@ -420,10 +548,16 @@ otherwise recover at the first decision of a hand.
 
 ## Current limitations
 
-* No learned agents, PPO, GRU, self-play or opponent modelling.
-* The encoder and the policy/value network exist, but nothing connects them to a
-  training loop yet; Agent B's history tokens are also encoded and unused.
-* No rollout collection, PPO update, checkpointing or evaluation harness.
+* No learned agents, PPO, GRU or opponent modelling yet.
+* The encoder, the policy/value network and the rollout buffer exist, but nothing
+  connects them to a training loop; Agent B's history tokens are also encoded and
+  unused.
+* No PPO update, checkpointing or evaluation harness.
+* The `lambda = 0.95` choice is a starting point, not a measurement: on a
+  four-decision hand the terminal shock still reaches the first decision with
+  weight `0.95³ ≈ 0.86`.
+* Credit for chance and opponent actions is attributed to the learner's previous
+  action. The estimate is unbiased over many hands but noisy within one.
 * The smoke test uses uniformly random agents, not competent baselines.
 * Only heads-up **limit** Hold'em is set up; No-Limit is deliberately not used.
 * No GUI, online play or real-money connection.
@@ -435,26 +569,25 @@ otherwise recover at the first decision of a hand.
 | Stage | Work | Status |
 |---|---|---|
 | 1 | Verify simulator; document observations, actions, payoffs and history; encode Agent B's tokens | ✅ done |
-| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **in progress — encoder + network done** |
+| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **in progress — encoder, network and rollout done** |
 | 3 | Agent B: MLP + GRU over betting history, trained with PPO | planned |
 | 4 | Head-to-head evaluation, ablations and results write-up | planned |
 
-**Recommended next milestone: rollout collection and the PPO update.**
+**Recommended next milestone: the PPO update.**
 
 A sensible remaining Stage 2 scope:
 
 1. ~~Build the observation encoder: 131 numbers, masking, bounds checked.~~ ✅
 2. ~~Build the policy/value MLP (shared 256×2 trunk, `256→4` and `256→1`
    heads) with the legal-action mask applied inside `forward`.~~ ✅
-3. Collect rollouts: play hands against a fixed opponent, storing encoded states,
-   sampled actions, their log-probabilities, values and per-decision rewards.
+3. ~~Collect rollouts: encoded states, sampled actions, sampling-time
+   log-probabilities and values, terminal-only rewards, GAE advantages.~~ ✅
 4. Implement the PPO update: clipped ratio, entropy bonus, value-loss
    coefficient ≈ 0.5, advantage and return normalisation, global gradient-norm
    clipping.
-5. Add deterministic seeding, checkpointing (the network already round-trips
-   through `state_dict`) and a fixed-seed evaluation harness with confidence
-   intervals. The observed per-hand standard deviation is roughly 2.3–2.6 big
-   blinds, so an edge of 0.05 bb needs thousands of hands before it is
-   statistically meaningful.
+5. Add checkpointing (the network already round-trips through `state_dict`) and a
+   fixed-seed evaluation harness with confidence intervals. The observed
+   per-hand standard deviation is roughly 2.3–2.6 big blinds, so an edge of
+   0.05 bb needs thousands of hands before it is statistically meaningful.
 6. Only after Agent A is stable, add the GRU history encoder for Agent B and
    compare the two under the same evaluation protocol.
