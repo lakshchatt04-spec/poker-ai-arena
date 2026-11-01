@@ -3,8 +3,8 @@
 Stage 1 exposes simulator-inspection helpers plus the fixed-size betting-history
 encoding Agent B's GRU will read.  Stage 2 adds Agent A's 131-number observation
 encoder, its policy/value network, the rollout buffer that turns played hands into
-GAE advantages, and the clipped PPO update.  A training loop and evaluation
-harness are not implemented yet.
+GAE advantages, the clipped PPO update, and a training loop with a fixed-seed
+evaluation harness.
 """
 
 from .encoding import (
@@ -60,6 +60,19 @@ from .rollout import (
     compute_gae,
     normalize_advantages,
 )
+from .training import (
+    Z_95,
+    EvaluationRecord,
+    EvaluationResult,
+    TrainingConfig,
+    TrainingResult,
+    evaluate,
+    load_checkpoint,
+    random_opponent,
+    save_checkpoint,
+    scripted_opponent,
+    train,
+)
 
 __all__ = [
     "ACTION_NAMES",
@@ -78,8 +91,11 @@ __all__ = [
     "RAISE_LIMIT",
     "STREET_NAMES",
     "TOKEN_DIM",
+    "Z_95",
     "ActionToken",
     "EncodedState",
+    "EvaluationRecord",
+    "EvaluationResult",
     "HandResult",
     "HistorySequence",
     "HistoryTracker",
@@ -92,18 +108,26 @@ __all__ = [
     "RolloutBuffer",
     "StepRecord",
     "Trajectory",
+    "TrainingConfig",
+    "TrainingResult",
     "Transition",
     "action_mask",
     "collect_trajectories",
     "compute_gae",
     "decode_observation",
     "encode_token",
+    "evaluate",
+    "load_checkpoint",
     "make_environment",
     "normalize",
     "normalize_advantages",
     "play_random_hand",
+    "random_opponent",
+    "save_checkpoint",
+    "scripted_opponent",
     "small_blind_player",
     "street_from_board_size",
+    "train",
     "validate_environment_contract",
     "verify_observation_is_legal",
 ]

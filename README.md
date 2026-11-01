@@ -35,14 +35,16 @@ poker-ai-arena/
 │       ├── history.py              # Agent B's betting-history tokens
 │       ├── networks.py             # Agent A's policy/value MLP
 │       ├── ppo.py                  # clipped PPO update
-│       └── rollout.py              # rollout buffer + GAE for the PPO update
+│       ├── rollout.py              # rollout buffer + GAE for the PPO update
+│       └── training.py             # training loop + fixed-seed evaluation
 ├── scripts/
 │   ├── test_encoding.py            # executable encoder report
 │   ├── test_environment.py         # executable smoke test / report
 │   ├── test_history.py             # executable history-encoding report
 │   ├── test_networks.py            # executable network report
 │   ├── test_ppo.py                 # executable PPO-update report
-│   └── test_rollout.py             # executable rollout / GAE report
+│   ├── test_rollout.py             # executable rollout / GAE report
+│   └── train_agent_a.py            # trains Agent A and evaluates it
 ├── tests/
 │   ├── conftest.py                 # puts src/ on sys.path for pytest
 │   ├── test_encoding.py            # encoder tests
@@ -50,7 +52,8 @@ poker-ai-arena/
 │   ├── test_history.py             # history-encoding tests
 │   ├── test_networks.py            # network tests
 │   ├── test_ppo.py                 # PPO-update tests
-│   └── test_rollout.py             # rollout and GAE tests
+│   ├── test_rollout.py             # rollout and GAE tests
+│   └── test_training.py            # training-loop and evaluation tests
 ├── .venv/                          # local environment (git-ignored)
 ├── .gitignore
 ├── pytest.ini                      # limits collection to tests/
@@ -109,6 +112,9 @@ python scripts\test_networks.py
 python scripts\test_rollout.py
 python scripts\test_ppo.py
 python -m pytest -q
+
+# Train Agent A, then evaluate as it goes.
+python scripts\train_agent_a.py
 ```
 
 Without activation:
@@ -123,12 +129,23 @@ Without activation:
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
+The training script takes flags if the defaults are too slow for a quick check:
+
+```powershell
+# A quick smoke run: about 15 seconds.
+python scripts\train_agent_a.py --iterations 3 --hands 64 `
+  --eval-hands 200 --eval-every 1 --run-name smoke
+
+# The full run, writing runs\agent_a_*.csv and checkpoints\agent_a_*.pt.
+python scripts\train_agent_a.py --iterations 50 --hands 320
+```
+
 The environment smoke test ends with `All Stage 1 checks passed.`, the history
 smoke test with `All history-encoding checks passed.`, the encoder report with
 `All observation-encoder checks passed.`, the network report with
 `All network checks passed.`, the rollout report with
 `All rollout checks passed.`, the PPO report with `All PPO checks passed.`, and
-the test suite currently reports `125 passed`.
+the test suite currently reports `145 passed`.
 
 `pytest.ini` limits collection to `tests/` because
 `scripts/test_environment.py` and `tests/test_environment.py` share a filename
@@ -510,6 +527,87 @@ cycle.
 
 ---
 
+## Training loop and evaluation
+
+`training.py` connects the pieces without adding a new dependency:
+
+```text
+for iteration in 1..N:
+    collect 320 self-play hands                 -> ~1,000 decisions
+    RolloutBuffer.batch()                       -> raw advantages, returns
+    PPOUpdater.step()                           -> one update, 4 epochs
+    write the diagnostics row to CSV
+    every 10 iterations, and on the last one:
+        evaluate 2,000 fixed-seed hands vs a scripted opponent
+        write the evaluation row and a checkpoint
+```
+
+### Why evaluation is separate from the training reward
+
+The training batch is the data the policy is being fitted to, so its average
+payoff is an optimistic, high-variance number. Evaluation replays the *same*
+deals, from the same `evaluation_seed`, against the *same* scripted opponent
+every time. A change in that column is a change in the policy, not in the deal
+or the opponent.
+
+Evaluation plays **greedily** (`argmax` over the masked logits). The sampling
+policy is what is trained, but the mode is what a fixed-seed comparison should
+measure: sampling would add action noise on top of deal noise and make two runs
+with the same seed diverge for no reason.
+
+### How many hands does a measurement need?
+
+A hand's payoff is around `±11` bb and its standard deviation is roughly `2.4`
+bb. The 95 % interval for `n` hands is `1.96 × 2.4 / sqrt(n)`:
+
+| Hands | 95 % interval (bb/hand) |
+|---|---|
+| 500 | `±0.211` |
+| 2,000 | `±0.105` |
+| 8,900 | `±0.050` |
+| 20,000 | `±0.033` |
+
+So an edge of `0.05` bb/hand needs roughly nine thousand hands before it is
+distinguishable from zero, and 2,000 hands can only resolve effects of about
+`0.1` bb. This is why the script prints the interval next to every evaluation
+and why a small movement between two checkpoint evaluations should not be read
+as progress. It also rules out the training reward as a progress signal: it is
+one noisy sample per iteration, from a moving opponent and a changing policy.
+
+### Outputs
+
+| File | Contents |
+|---|---|
+| `runs/<run-name>_train.csv` | one row per iteration: decisions, losses, entropy, KL, clip fraction, gradient norm, minibatches, samples |
+| `runs/<run-name>_eval.csv` | one row per evaluation: hands, opponent, mean bb, standard error, 95 % interval, total bb |
+| `checkpoints/<run-name>_<iter>.pt` | `state_dict` + iteration + the full training config |
+
+`save_checkpoint` / `load_checkpoint` round-trip the weights exactly; the config
+is stored so an evaluation can be reproduced from the file alone. The test suite
+asserts that a checkpoint's weights reproduce the evaluation it came from.
+
+### Reproducibility
+
+The network initialisation, the environment, the action sampler and the
+minibatch shuffle are all seeded from `config.seed`. Two runs with the same
+config produce identical CSVs and identical final weights; the test suite
+compares every parameter tensor. The evaluation environment uses a separate
+`evaluation_seed`, so changing the training seed does not change the deals the
+evaluations are played on.
+
+### What the tests pin down
+
+`tests/test_training.py` (20 tests) pins the defaults, rejects invalid settings,
+checks the scripted and random opponents, that evaluation returns finite
+statistics with `ci95 == 1.96 × stderr` and a zero-sum-consistent total, that it
+is deterministic for the same weights and seed and restores the network's
+training mode, the checkpoint round-trip and its metadata, the row, evaluation
+and checkpoint counts, CSV contents, evaluation on the final iteration when it
+is off schedule, that training changes the weights, the progress callback order,
+and full-run reproducibility.
+
+---
+
 ## Verified simulator contract (RLCard 1.2.0)
 
 These facts were checked by running code, not copied from documentation.
@@ -657,11 +755,13 @@ otherwise recover at the first decision of a hand.
 
 ## Current limitations
 
-* No trained agent yet: the PPO update exists, but there is no training loop,
-  checkpointing or evaluation harness.
-* The encoder, the policy/value network, the rollout buffer and the PPO update
-  exist, but nothing connects them in a loop; Agent B's history tokens are also
-  encoded and unused.
+* No trained agent yet. The training loop and evaluation harness exist and are
+  tested, but no long run has been done, so there are no results to report.
+* The encoder, the policy/value network, the rollout buffer, the PPO update and
+  the training loop all exist; Agent B's history tokens are encoded and unused.
+* The evaluation opponent calls or checks, so it never folds a bet and never
+  raises. It measures "does the agent beat a passive caller", not "is the agent
+  strong". A stronger baseline is needed before any claim about play quality.
 * The `lambda = 0.95` choice is a starting point, not a measurement: on a
   four-decision hand the terminal shock still reaches the first decision with
   weight `0.95³ ≈ 0.86`.
@@ -678,11 +778,11 @@ otherwise recover at the first decision of a hand.
 | Stage | Work | Status |
 |---|---|---|
 | 1 | Verify simulator; document observations, actions, payoffs and history; encode Agent B's tokens | ✅ done |
-| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **in progress — encoder, network, rollout and PPO done** |
+| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **in progress — all components built; needs a real training run** |
 | 3 | Agent B: MLP + GRU over betting history, trained with PPO | planned |
 | 4 | Head-to-head evaluation, ablations and results write-up | planned |
 
-**Recommended next milestone: the training loop and evaluation harness.**
+**Recommended next milestone: actually train Agent A and read the curve.**
 
 A sensible remaining Stage 2 scope:
 
@@ -694,10 +794,13 @@ A sensible remaining Stage 2 scope:
 4. ~~Implement the PPO update: clipped ratio, entropy bonus, value-loss
    coefficient ≈ 0.5, advantage and return normalisation, global gradient-norm
    clipping.~~ ✅
-5. Build the training loop: alternate rollout collection and updates, log the
-   diagnostics already returned by `PPOUpdater.step()`, checkpoint periodically.
-6. Add a fixed-seed evaluation harness with confidence intervals. The observed
-   per-hand standard deviation is roughly 2.3–2.6 big blinds, so an edge of
-   0.05 bb needs thousands of hands before it is statistically meaningful.
-7. Only after Agent A is stable, add the GRU history encoder for Agent B and
+5. ~~Build the training loop: alternate rollout collection and updates, log the
+   diagnostics already returned by `PPOUpdater.step()`, checkpoint
+   periodically.~~ ✅
+6. ~~Add a fixed-seed evaluation harness with confidence intervals.~~ ✅
+7. Run the full 50-iteration training job (one measured iteration — 320 hands,
+   update and a 200-hand evaluation — takes about 10 seconds including startup,
+   so the full run is a few minutes on CPU) and inspect the value loss, entropy
+   and evaluation interval before drawing any conclusion.
+8. Only after Agent A is stable, add the GRU history encoder for Agent B and
    compare the two under the same evaluation protocol.
