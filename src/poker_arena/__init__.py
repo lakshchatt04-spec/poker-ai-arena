@@ -2,8 +2,9 @@
 
 Stage 1 exposes simulator-inspection helpers plus the fixed-size betting-history
 encoding Agent B's GRU will read.  Stage 2 adds Agent A's 131-number observation
-encoder, its policy/value network, and the rollout buffer that turns played hands
-into GAE advantages.  The PPO update itself is not implemented yet.
+encoder, its policy/value network, the rollout buffer that turns played hands into
+GAE advantages, and the clipped PPO update.  A training loop and evaluation
+harness are not implemented yet.
 """
 
 from .encoding import (
@@ -47,6 +48,7 @@ from .networks import (
     MASKED_LOGIT,
     PolicyValueNet,
 )
+from .ppo import PPOConfig, PPOUpdater
 from .rollout import (
     GAE_LAMBDA,
     GAMMA,
@@ -83,6 +85,8 @@ __all__ = [
     "HistoryTracker",
     "ObservationEncoder",
     "ObservationView",
+    "PPOConfig",
+    "PPOUpdater",
     "PolicyValueNet",
     "RolloutBatch",
     "RolloutBuffer",

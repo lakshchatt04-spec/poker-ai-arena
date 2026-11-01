@@ -34,12 +34,14 @@ poker-ai-arena/
 │       ├── environment.py          # Stage 1 inspection helpers
 │       ├── history.py              # Agent B's betting-history tokens
 │       ├── networks.py             # Agent A's policy/value MLP
+│       ├── ppo.py                  # clipped PPO update
 │       └── rollout.py              # rollout buffer + GAE for the PPO update
 ├── scripts/
 │   ├── test_encoding.py            # executable encoder report
 │   ├── test_environment.py         # executable smoke test / report
 │   ├── test_history.py             # executable history-encoding report
 │   ├── test_networks.py            # executable network report
+│   ├── test_ppo.py                 # executable PPO-update report
 │   └── test_rollout.py             # executable rollout / GAE report
 ├── tests/
 │   ├── conftest.py                 # puts src/ on sys.path for pytest
@@ -47,6 +49,7 @@ poker-ai-arena/
 │   ├── test_environment.py         # Stage 1 contract tests
 │   ├── test_history.py             # history-encoding tests
 │   ├── test_networks.py            # network tests
+│   ├── test_ppo.py                 # PPO-update tests
 │   └── test_rollout.py             # rollout and GAE tests
 ├── .venv/                          # local environment (git-ignored)
 ├── .gitignore
@@ -104,6 +107,7 @@ python scripts\test_history.py
 python scripts\test_encoding.py
 python scripts\test_networks.py
 python scripts\test_rollout.py
+python scripts\test_ppo.py
 python -m pytest -q
 ```
 
@@ -115,6 +119,7 @@ Without activation:
 .\.venv\Scripts\python.exe scripts\test_encoding.py
 .\.venv\Scripts\python.exe scripts\test_networks.py
 .\.venv\Scripts\python.exe scripts\test_rollout.py
+.\.venv\Scripts\python.exe scripts\test_ppo.py
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
@@ -122,7 +127,8 @@ The environment smoke test ends with `All Stage 1 checks passed.`, the history
 smoke test with `All history-encoding checks passed.`, the encoder report with
 `All observation-encoder checks passed.`, the network report with
 `All network checks passed.`, the rollout report with
-`All rollout checks passed.`, and the test suite currently reports `102 passed`.
+`All rollout checks passed.`, the PPO report with `All PPO checks passed.`, and
+the test suite currently reports `125 passed`.
 
 `pytest.ini` limits collection to `tests/` because
 `scripts/test_environment.py` and `tests/test_environment.py` share a filename
@@ -401,6 +407,109 @@ argument for normalising before the update.
 
 ---
 
+## PPO update
+
+`ppo.py` optimises one rollout batch at a time:
+
+```text
+L_policy = -mean( min(ratio * A, clamp(ratio, 1-eps, 1+eps) * A) )
+L_value  =  mean( (V(s) - return)^2 )
+L        =  L_policy - entropy_coef * H[pi] + value_coef * L_value
+ratio    =  exp(log_pi_new(a) - log_pi_old(a))
+```
+
+| Setting | Value |
+|---|---|
+| clip epsilon | 0.2 |
+| entropy coefficient | 0.01 |
+| value coefficient | 0.5 |
+| epochs | 4 |
+| minibatch size | 256 |
+| max gradient norm | 0.5 |
+| optimiser | Adam, `3e-4` |
+
+### The old log-probability must be a constant
+
+On the first pass the network that samples and the network being scored are the
+same, so `ratio` is exactly `1` and the clip cannot bind. The clip exists for the
+later epochs: once the weights have moved, it stops one batch from being
+over-exploited.
+
+That only works because `log_pi_old` is a stored constant. Recompute it from the
+current weights and `ratio` becomes `exp(0) = 1` on every pass; the clip never
+binds, no error is raised, and PPO quietly degrades into a policy gradient that
+can walk arbitrarily far from the sampling policy. The report makes this
+visible by shifting the stored log-probabilities by `5`:
+
+```text
+fresh log-probs : clip fraction 0.0000, approx KL 5.81e-03
+stale log-probs : clip fraction 1.0000, approx KL 4.0087
+```
+
+### Two details that are easy to get wrong
+
+* **Advantages are normalised once per rollout**, before the epochs start, not
+  per minibatch. Per-minibatch normalisation changes what the same sample means
+  on every pass. A test asserts that multiplying every advantage by 1,000 leaves
+  the update unchanged.
+* **Returns stay raw.** They are the value targets; rescaling them would change
+  the value loss's scale. `returns == advantages + values` from the buffer.
+
+The value loss is deliberately **not** clipped. Clipping the value is a second
+mechanism with its own failure modes; it is worth adding only if the value loss
+is observed to explode. Global gradient-norm clipping is there from the start —
+in the report the pre-clip norm is `1.01` against a limit of `0.5`, so the clip
+is doing real work.
+
+### What the report measured
+
+A 320-hand self-play rollout (about 1,000 decisions, value loss `10.38`, entropy
+`1.096`, zero illegal stored actions), then four epochs:
+
+```text
+value loss  10.3786 -> 10.0110      entropy 1.0962 -> 1.0903
+clip fraction 0.0000                approx KL 0.0017
+grad norm (pre-clip) 1.0059         illegal probability 0.0
+```
+
+The value loss falls; the policy barely moves in one update, which is expected
+at `3e-4` with an advantage signal this noisy.
+
+### A measured footgun: Adam's step size versus the entropy bonus
+
+An early version of the entropy test used `learning_rate=1e-2`. With a strong
+entropy coefficient the entropy **fell** (`1.3805 -> 0.6708`) instead of rising.
+The gradient pointed the right way; Adam normalises each parameter's step to
+roughly the learning rate regardless of gradient magnitude, so the policy
+overshot the near-uniform maximum. The test now uses `1e-3`. The lesson is not
+"entropy is broken" but "with Adam, a large learning rate can turn any bonus
+into an overshoot", so the reported learning rate is part of the objective's
+behaviour, not just a training detail.
+
+### Diagnostics
+
+`PPOUpdater.step()` returns `policy_loss`, `value_loss`, `entropy`,
+`total_loss`, `approx_kl`, `clip_fraction`, `grad_norm` (all means over the
+minibatches), plus `epochs`, `minibatches` and `samples`. A single loss number
+hides which term is misbehaving; `approx_kl` and `clip_fraction` are the two
+that say whether the update is still inside its trust region.
+
+### What the tests pin down
+
+`tests/test_ppo.py` (23 tests) pins the defaults and rejects invalid settings,
+checks that an update changes parameters and returns finite diagnostics, that
+fresh log-probabilities start with `ratio == 1` (clip fraction `0`, KL `0`) and
+stale ones clip every sample, that zero advantages leave the policy head
+bit-identical while the value head still learns, that the value loss moves the
+value towards its targets, that the entropy bonus raises entropy from a sharp
+policy, that advantage scaling is invariant, that unnormalised huge advantages
+engage gradient clipping, minibatch accounting, seeded reproducibility, that the
+network is left in training mode, batch validation, illegal actions staying at
+exactly zero probability after updates, and a full rollout → update → rollout
+cycle.
+
+---
+
 ## Verified simulator contract (RLCard 1.2.0)
 
 These facts were checked by running code, not copied from documentation.
@@ -548,11 +657,11 @@ otherwise recover at the first decision of a hand.
 
 ## Current limitations
 
-* No learned agents, PPO, GRU or opponent modelling yet.
-* The encoder, the policy/value network and the rollout buffer exist, but nothing
-  connects them to a training loop; Agent B's history tokens are also encoded and
-  unused.
-* No PPO update, checkpointing or evaluation harness.
+* No trained agent yet: the PPO update exists, but there is no training loop,
+  checkpointing or evaluation harness.
+* The encoder, the policy/value network, the rollout buffer and the PPO update
+  exist, but nothing connects them in a loop; Agent B's history tokens are also
+  encoded and unused.
 * The `lambda = 0.95` choice is a starting point, not a measurement: on a
   four-decision hand the terminal shock still reaches the first decision with
   weight `0.95³ ≈ 0.86`.
@@ -569,11 +678,11 @@ otherwise recover at the first decision of a hand.
 | Stage | Work | Status |
 |---|---|---|
 | 1 | Verify simulator; document observations, actions, payoffs and history; encode Agent B's tokens | ✅ done |
-| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **in progress — encoder, network and rollout done** |
+| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **in progress — encoder, network, rollout and PPO done** |
 | 3 | Agent B: MLP + GRU over betting history, trained with PPO | planned |
 | 4 | Head-to-head evaluation, ablations and results write-up | planned |
 
-**Recommended next milestone: the PPO update.**
+**Recommended next milestone: the training loop and evaluation harness.**
 
 A sensible remaining Stage 2 scope:
 
@@ -582,12 +691,13 @@ A sensible remaining Stage 2 scope:
    heads) with the legal-action mask applied inside `forward`.~~ ✅
 3. ~~Collect rollouts: encoded states, sampled actions, sampling-time
    log-probabilities and values, terminal-only rewards, GAE advantages.~~ ✅
-4. Implement the PPO update: clipped ratio, entropy bonus, value-loss
+4. ~~Implement the PPO update: clipped ratio, entropy bonus, value-loss
    coefficient ≈ 0.5, advantage and return normalisation, global gradient-norm
-   clipping.
-5. Add checkpointing (the network already round-trips through `state_dict`) and a
-   fixed-seed evaluation harness with confidence intervals. The observed
+   clipping.~~ ✅
+5. Build the training loop: alternate rollout collection and updates, log the
+   diagnostics already returned by `PPOUpdater.step()`, checkpoint periodically.
+6. Add a fixed-seed evaluation harness with confidence intervals. The observed
    per-hand standard deviation is roughly 2.3–2.6 big blinds, so an edge of
    0.05 bb needs thousands of hands before it is statistically meaningful.
-6. Only after Agent A is stable, add the GRU history encoder for Agent B and
+7. Only after Agent A is stable, add the GRU history encoder for Agent B and
    compare the two under the same evaluation protocol.
