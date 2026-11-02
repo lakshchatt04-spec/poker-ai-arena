@@ -84,6 +84,7 @@ def test_default_config_is_pinned():
     assert config.max_grad_norm == 0.5
     assert config.learning_rate == 3e-4
     assert config.normalize_advantages is True
+    assert config.normalize_value_loss is True
 
 
 @pytest.mark.parametrize(
@@ -122,6 +123,8 @@ def test_step_changes_parameters_and_reports_finite_diagnostics(net):
     for key in (
         "policy_loss",
         "value_loss",
+        "explained_variance",
+        "return_std",
         "entropy",
         "total_loss",
         "approx_kl",
@@ -204,6 +207,62 @@ def test_value_loss_pulls_the_value_towards_the_returns(net):
         )[1].numpy()
 
     assert np.abs(after - target).mean() < np.abs(before - target).mean()
+
+
+def test_value_loss_is_mse_divided_by_return_variance(net):
+    """One epoch, one minibatch: the reported loss is the pre-update fit."""
+
+    batch = _synthetic_batch(net, advantages=np.zeros(16), return_offset=2.0)
+    config = PPOConfig(epochs=1, minibatch_size=len(batch))
+
+    stats = PPOUpdater(net, config, seed=0).step(batch)
+
+    expected = float(
+        np.mean((batch.values.astype(np.float64) - batch.returns) ** 2)
+        / batch.returns.astype(np.float64).var()
+    )
+    assert stats["value_loss"] == pytest.approx(expected, rel=1e-4)
+    # The two diagnostics are the same number read from opposite ends: a critic
+    # that leaves 90 % of the variance unexplained has explained 10 % of it.
+    assert stats["value_loss"] == pytest.approx(
+        1.0 - stats["explained_variance"], rel=1e-4
+    )
+
+
+def test_explained_variance_describes_the_sampling_critic(net):
+    batch = _synthetic_batch(net)
+    stats = PPOUpdater(net, seed=0).step(batch)
+
+    target = batch.returns.astype(np.float64)
+    predicted = batch.values.astype(np.float64)
+    expected = 1.0 - np.mean((target - predicted) ** 2) / target.var()
+
+    assert stats["explained_variance"] == pytest.approx(expected, abs=1e-5)
+    assert stats["return_std"] == pytest.approx(target.std(), rel=1e-5)
+
+
+def test_a_mean_predicting_critic_reports_zero_explained_variance(net):
+    batch = _synthetic_batch(net, advantages=np.zeros(16))
+    mean_critic = replace(
+        batch, values=np.full_like(batch.values, batch.returns.mean())
+    )
+    stats = PPOUpdater(net, seed=0).step(mean_critic)
+
+    assert stats["explained_variance"] == pytest.approx(0.0, abs=1e-5)
+
+
+def test_unnormalised_value_loss_keeps_the_raw_mse(net):
+    batch = _synthetic_batch(net, advantages=np.zeros(16), return_offset=2.0)
+    config = PPOConfig(
+        epochs=1, minibatch_size=len(batch), normalize_value_loss=False
+    )
+
+    stats = PPOUpdater(net, config, seed=0).step(batch)
+
+    expected = float(
+        np.mean((batch.values.astype(np.float64) - batch.returns) ** 2)
+    )
+    assert stats["value_loss"] == pytest.approx(expected, rel=1e-4)
 
 
 def test_entropy_bonus_increases_entropy(net):

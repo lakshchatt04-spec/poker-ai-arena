@@ -8,7 +8,7 @@ Reads ``runs/<run-name>_train.csv`` and ``runs/<run-name>_eval.csv`` and writes
 ``runs/<run-name>_curve.png``.
 
 The layout is deliberate: the evaluation panel answers "is it getting better?",
-the value/entropy panel answers "is it still learning?", and the two diagnostics
+the explained-variance/entropy panel answers "is it still learning?", and the two diagnostics
 panels answer "is the update still under control?". A single loss curve would
 mix all three questions into one unreadable line.
 """
@@ -39,6 +39,9 @@ TRAIN_COLUMNS = (
     "grad_norm",
 )
 
+#: Written by training runs from the value-head diagnosis onwards.  Older logs
+#: do not have it, so the panel falls back to the raw value loss.
+OPTIONAL_COLUMNS = ("explained_variance",)
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
     if not path.exists():
@@ -88,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
     iteration = _column(train_rows, "iteration")
     decisions = _column(train_rows, "decisions")
     value_loss = _column(train_rows, "value_loss")
+    has_ev = "explained_variance" in train_rows[0]
+    explained = _column(train_rows, "explained_variance") if has_ev else None
     entropy = _column(train_rows, "entropy")
     approx_kl = _column(train_rows, "approx_kl")
     clip_fraction = _column(train_rows, "clip_fraction")
@@ -151,10 +156,24 @@ def main(argv: list[str] | None = None) -> int:
     # -- the two learning signals ------------------------------------------
     top_right = axes[0, 1]
     mark_evaluations(top_right)
-    top_right.plot(iteration, value_loss, color="tab:red", linewidth=1.4)
-    top_right.set_title("Value loss and policy entropy")
-    top_right.set_ylabel("value loss", color="tab:red")
-    top_right.tick_params(axis="y", labelcolor="tab:red")
+    if explained is not None:
+        top_right.plot(
+            iteration, explained, color="tab:red", linewidth=1.4,
+            label="explained variance",
+        )
+        top_right.axhline(0.0, color="black", linewidth=0.9)
+        top_right.set_title(
+            "Critic explained variance and policy entropy\n"
+            "(explained variance is the only scale-free critic measure)"
+        )
+        top_right.set_ylabel("explained variance", color="tab:red")
+        top_right.tick_params(axis="y", labelcolor="tab:red")
+        top_right.legend(loc="upper left", frameon=False, fontsize=9)
+    else:
+        top_right.plot(iteration, value_loss, color="tab:red", linewidth=1.4)
+        top_right.set_title("Value loss and policy entropy")
+        top_right.set_ylabel("value loss", color="tab:red")
+        top_right.tick_params(axis="y", labelcolor="tab:red")
 
     entropy_axis = top_right.twinx()
     entropy_axis.plot(
@@ -210,7 +229,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"iterations     : {len(train_rows)}")
     print(f"decisions      : {int(decisions.sum())} total, "
           f"{decisions.mean():.0f} per iteration")
-    print(f"value loss     : {value_loss[0]:.4f} -> {value_loss[-1]:.4f}")
+    print(f"value loss     : {value_loss[0]:.4f} -> {value_loss[-1]:.4f} "
+          f"(fraction of return variance)")
+    if explained is not None:
+        print(f"explained var  : {explained[0]:+.4f} -> {explained[-1]:+.4f} "
+              f"(max {explained.max():+.4f})")
     print(f"entropy        : {entropy[0]:.4f} -> {entropy[-1]:.4f}")
     print(f"approx KL      : max {approx_kl.max():.5f}, "
           f"mean {approx_kl.mean():.5f}")

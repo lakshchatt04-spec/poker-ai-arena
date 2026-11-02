@@ -16,13 +16,37 @@ PPO silently becomes a plain policy gradient that can walk arbitrarily far.
 The objective, clipped:
 
     L_policy = -mean( min(ratio * A, clamp(ratio, 1-eps, 1+eps) * A) )
-    L_value  =  mean( (V(s) - return)^2 )
+    L_value  =  mean( ((V(s) - return) / std(return))^2 )
     L        =  L_policy - entropy_coef * H[pi] + value_coef * L_value
 
 Advantages are normalised **once** per rollout, before the epochs start.  Doing
 it per minibatch would change the objective between epochs and let the same
-sample mean something different on every pass.  Returns stay raw: they are the
-value targets, and rescaling them would change the value loss's scale.
+sample mean something different on every pass.
+
+The value targets are divided by their own rollout standard deviation, so
+``L_value`` is the *fraction of return variance left unexplained*: ``0`` is a
+perfect critic, ``1`` is a critic that predicts the mean.  ``explained_variance``
+is the same number from the other end, ``1 - L_value``.
+
+The first reason is that a raw MSE on returns is not comparable between
+iterations: the returns' spread moves with the policy, so the same critic can
+show a rising loss while it is getting *better*.  The first Agent A run rose
+from ``7.95`` to ``128.07`` and back to ``60.57`` while the return standard
+deviation went ``9.7 -> 7.9``; almost all of that shape was the target moving.
+
+The second reason is the shared gradient.  Measured on checkpoint 50, the raw
+value term was ``99.8 %`` of the pre-clip gradient norm (``5.07``) and the
+policy term ``1.7 %`` (``0.087``), so the global clip at ``0.5`` was not an
+emergency brake but the permanent operating point, rescaling every minibatch by
+a factor set by the critic's error.  Adam is almost invariant to a *constant*
+rescale -- it divides by a running RMS of each parameter's gradient -- but a
+factor that jumps between minibatches perturbs the momentum and second-moment
+estimates in a way that has nothing to do with the policy.  After this change
+that batch reports a norm of ``0.48``, so the clip acts occasionally instead of
+always.  Measured directly, clipping at ``0.5`` versus not clipping changes the
+summed parameter update by about ``4 %``, which is the honest size of this
+effect: it is a reason not to let the clip be permanently saturated, not a 10x
+speed-up.
 
 The value loss is deliberately not clipped.  Clipping the value is a second
 mechanism with its own bugs; it is worth adding only if the value loss is
@@ -59,6 +83,10 @@ class PPOConfig:
     entropy_coef: float = 0.01
     #: Weight on the value loss, kept near 0.5 so critic and actor learn together.
     value_coef: float = 0.5
+    #: Divide the value targets by the rollout's return standard deviation, so
+    #: the loss is a fraction of variance rather than a squared number of big
+    #: blinds.  See the module docstring for why this also matters to the clip.
+    normalize_value_loss: bool = True
     #: Passes over the same rollout batch.
     epochs: int = 4
     #: Rows per gradient step.  The last minibatch may be smaller.
@@ -150,6 +178,29 @@ class PPOUpdater:
             else np.asarray(batch.advantages, dtype=np.float32)
         )
 
+        # Diagnostics about the critic that produced this rollout.  Measured
+        # before any gradient step, so it describes the sampling policy's own
+        # values rather than the ones being fitted right now.
+        sampled_returns = np.asarray(batch.returns, dtype=np.float64)
+        sampled_values = np.asarray(batch.values, dtype=np.float64)
+        return_variance = float(sampled_returns.var())
+        return_std = float(np.sqrt(return_variance))
+        if return_variance > 0.0:
+            explained_variance = 1.0 - float(
+                np.mean((sampled_returns - sampled_values) ** 2)
+            ) / return_variance
+        else:
+            # Every return is identical: there is nothing to explain, and a mean
+            # predictor is already perfect.
+            explained_variance = 0.0
+
+        # A degenerate batch (all returns equal) has nothing to scale by.
+        return_scale = (
+            return_std
+            if self.config.normalize_value_loss and return_std > 1e-8
+            else 1.0
+        )
+
         features = torch.as_tensor(np.ascontiguousarray(batch.features))
         legal_masks = torch.as_tensor(np.ascontiguousarray(batch.legal_masks))
         actions = torch.as_tensor(batch.actions, dtype=torch.long)
@@ -200,7 +251,9 @@ class PPOUpdater:
                     * advantages_tensor[index]
                 )
                 policy_loss = -torch.min(unclipped, clipped).mean()
-                value_loss = (values - returns[index]).pow(2).mean()
+                value_loss = (
+                    (values - returns[index]) / return_scale
+                ).pow(2).mean()
 
                 loss = (
                     policy_loss
@@ -235,6 +288,8 @@ class PPOUpdater:
         stats: dict[str, float | int] = {
             name: total / visited for name, total in totals.items()
         }
+        stats["explained_variance"] = explained_variance
+        stats["return_std"] = return_std
         stats["epochs"] = int(self.config.epochs)
         stats["minibatches"] = minibatches
         stats["samples"] = count

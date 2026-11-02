@@ -38,6 +38,7 @@ poker-ai-arena/
 │       ├── rollout.py              # rollout buffer + GAE for the PPO update
 │       └── training.py             # training loop + fixed-seed evaluation
 ├── scripts/
+│   ├── diagnose_value.py           # how predictable is the value target?
 │   ├── test_encoding.py            # executable encoder report
 │   ├── test_environment.py         # executable smoke test / report
 │   ├── test_history.py             # executable history-encoding report
@@ -57,7 +58,7 @@ poker-ai-arena/
 │   └── test_training.py            # training-loop and evaluation tests
 ├── .venv/                          # local environment (git-ignored)
 ├── docs/
-│   └── agent_a_curve.png           # figure from the first full run
+│   └── agent_a_curve.png           # figure from the second full run
 ├── .gitignore
 ├── pytest.ini                      # limits collection to tests/
 ├── requirements.txt
@@ -119,8 +120,11 @@ python -m pytest -q
 # Train Agent A, then evaluate as it goes.
 python scripts\train_agent_a.py
 
-# Plot the run's CSV logs to runs\agent_a_curve.png.
+# Plot that run's CSV logs to runs\agent_a_curve.png.
 python scripts\plot_training.py
+
+# Diagnose how much of the value target is predictable at all.
+python scripts\diagnose_value.py
 ```
 
 Without activation:
@@ -475,8 +479,11 @@ stale log-probs : clip fraction 1.0000, approx KL 4.0087
   per minibatch. Per-minibatch normalisation changes what the same sample means
   on every pass. A test asserts that multiplying every advantage by 1,000 leaves
   the update unchanged.
-* **Returns stay raw.** They are the value targets; rescaling them would change
-  the value loss's scale. `returns == advantages + values` from the buffer.
+* **Returns are divided by their own rollout standard deviation**, so the value
+  loss is `MSE / Var(return)`: a fraction of variance rather than a squared
+  number of big blinds. With raw returns the loss is not comparable between
+  iterations and the critic's gradient dominates the shared clip. `returns ==
+  advantages + values` from the buffer, before the division.
 
 The value loss is deliberately **not** clipped. Clipping the value is a second
 mechanism with its own failure modes; it is worth adding only if the value loss
@@ -498,6 +505,10 @@ grad norm (pre-clip) 1.0059         illegal probability 0.0
 The value loss falls; the policy barely moves in one update, which is expected
 at `3e-4` with an advantage signal this noisy.
 
+That report predates the value-target normalisation, so its `10.38` is a raw
+MSE. After the change the same batch reports `~1.0`, which is the fraction of
+return variance left unexplained; see the diagnosis section below.
+
 ### A measured footgun: Adam's step size versus the entropy bonus
 
 An early version of the entropy test used `learning_rate=1e-2`. With a strong
@@ -511,11 +522,13 @@ behaviour, not just a training detail.
 
 ### Diagnostics
 
-`PPOUpdater.step()` returns `policy_loss`, `value_loss`, `entropy`,
-`total_loss`, `approx_kl`, `clip_fraction`, `grad_norm` (all means over the
-minibatches), plus `epochs`, `minibatches` and `samples`. A single loss number
-hides which term is misbehaving; `approx_kl` and `clip_fraction` are the two
-that say whether the update is still inside its trust region.
+`PPOUpdater.step()` returns `policy_loss`, `value_loss`, `explained_variance`,
+`return_std`, `entropy`, `total_loss`, `approx_kl`, `clip_fraction`, `grad_norm`
+(all means over the minibatches), plus `epochs`, `minibatches` and `samples`. A
+single loss number hides which term is misbehaving; `approx_kl` and
+`clip_fraction` are the two that say whether the update is still inside its
+trust region, and `explained_variance` is the only scale-free reading of the
+critic.
 
 ### What the tests pin down
 
@@ -538,6 +551,7 @@ cycle.
 `training.py` connects the pieces without adding a new dependency:
 
 ```text
+evaluate 2,000 fixed-seed hands vs a scripted opponent   (iteration 0)
 for iteration in 1..N:
     collect 320 self-play hands                 -> ~1,000-4,000 decisions
     RolloutBuffer.batch()                       -> raw advantages, returns
@@ -623,12 +637,21 @@ and full-run reproducibility.
 
 ---
 
-## First training run: 50 iterations
+## Two 50-iteration training runs
 
 ```powershell
-python scripts\train_agent_a.py      # seed 0, 320 hands/iteration, 2,000-hand evaluation every 10
-python scripts\plot_training.py      # -> runs\agent_a_curve.png
+python scripts\train_agent_a.py --run-name agent_a      # the original harness
+python scripts\train_agent_a.py --run-name agent_a_v2   # after the value-head fix
+python scripts\plot_training.py --run-name agent_a_v2   # -> runs\agent_a_v2_curve.png
 ```
+
+Both runs use seed 0, 320 self-play hands per iteration, and a 2,000-hand
+evaluation against the same scripted opponent every 10 iterations. The second
+run changed only how the critic's loss is scaled and logged, and adds an
+iteration-0 measurement (which does not affect training); the network, the
+opponent and every hyper-parameter are identical, so the two are comparable.
+
+### Run 1: the original harness
 
 The full run took a few minutes on CPU and produced 159,035 decisions.
 
@@ -642,16 +665,9 @@ The full run took a few minutes on CPU and produced 159,035 decisions.
 | 40 | 3,200 | 55.18 | 0.583 | +0.161 | ±0.241 |
 | 50 | 3,229 | 60.57 | 0.596 | +0.230 | ±0.223 |
 
-![Agent A's first 50-iteration training run](docs/agent_a_curve.png)
-
-The plot is written by `scripts/plot_training.py`; the copy above is the seed-0
-run.
-
-### What improved
-
-There is no iteration-0 evaluation — a gap in the harness. Reconstructing the
-initial network (same seed, `torch.manual_seed(0)` then `PolicyValueNet()`) and
-replaying the same 2,000 deals gives:
+Run 1 has no iteration-0 evaluation — a gap the harness now fills. Reconstructing
+the initial network (same seed, `torch.manual_seed(0)` then `PolicyValueNet()`)
+and replaying the same 2,000 deals gives:
 
 ```text
 initial net   : -0.1050 bb/hand  (+/- 0.1411)
@@ -659,24 +675,63 @@ final net     : +0.2295 bb/hand  (+/- 0.2228)
 paired change : +0.3345 bb/hand  (+/- 0.1539 paired 95%)
 ```
 
+### Run 2: iteration 0 measured, critic scale fixed
+
+`value loss` here is `MSE / Var(return)`, the fraction of return variance left
+unexplained, and `EV` is the critic's explained variance (`1 - value loss`).
+Both are scale-free, unlike run 1's raw big-blind MSE.
+
+| Iteration | Decisions | Value loss | EV | Entropy | Eval (bb/hand) | 95 % |
+|---|---|---|---|---|---|---|
+| 0 | — | — | — | — | **−0.1050** | ±0.1411 |
+| 1 | 945 | 0.985 | −0.00 | 1.094 | — | — |
+| 10 | 3,851 | 0.963 | 0.02 | 0.648 | +0.0880 | ±0.2108 |
+| 20 | 3,739 | 0.945 | 0.03 | 0.543 | +0.1040 | ±0.2363 |
+| 30 | 3,369 | 0.908 | 0.07 | 0.471 | +0.2275 | ±0.2203 |
+| 40 | 3,423 | 0.924 | 0.06 | 0.451 | +0.2580 | ±0.2223 |
+| 50 | 3,345 | 0.937 | 0.03 | 0.414 | **+0.2765** | ±0.2128 |
+
+![Agent A's second 50-iteration training run](docs/agent_a_curve.png)
+
+The plot is written by `scripts/plot_training.py`; the copy above is run 2.
+
+The iteration-0 row is a logged measurement, not a reconstruction, and it returns
+`-0.1050 ± 0.1411` — the same number run 1's start had to be rebuilt to obtain.
+That is the check that changing the critic's loss did not change the game.
+
+```text
+iteration  0 : -0.1050 bb/hand  (+/- 0.1411)
+iteration 50 : +0.2765 bb/hand  (+/- 0.2128)
+paired change: +0.3815 bb/hand  (+/- 0.1500 paired 95%, 2,000 deals)
+```
+
 The unpaired intervals overlap, but pairing the same deal removes most of the
 variance: the paired interval excludes zero, so the improvement is resolved even
-though neither individual measurement is precise to 0.33 bb. That is the whole
+though neither individual measurement is precise to 0.21 bb. That is the whole
 argument for fixed-seed evaluation, and for pairing rather than comparing two
 independent means.
 
-Decisions per hand rose from **3.0 to 10.1**: the agent stopped folding and
-started playing hands to the end. Against an opponent that never folds, that is
-the correct direction.
+The critic's per-iteration `EV` stays in `-0.00 … 0.10` (mean ≈ `0.03`), which is
+exactly the information ceiling measured below. The critic did not get better,
+and was not supposed to: the fix was to measure it on a stable axis and stop its
+raw loss from setting the gradient clip. Gradients now sit at `0.31–0.58`
+against a limit of `0.5`, so the clip is an occasional brake rather than the
+permanent operating point.
+
+Decisions per hand rose from **3.0 to 10.1** in run 1: the agent stopped folding
+and started playing hands to the end. Against an opponent that never folds, that
+is the correct direction. Run 2 reproduces the same behaviour.
 
 ### What did not
 
-**It plateaued at iteration 20.** Evaluations 20 → 50 are statistically
-indistinguishable, and the best point estimate is the first one after the
-fast-learning phase.
+**The curve still has not been resolved after iteration 20.** The point estimate
+keeps rising in run 2 (`+0.104` at 20 to `+0.277` at 50), but the difference
+between those two evaluations is about `1.1` standard errors, so it is not
+resolved by 2,000 hands. Only the change from iteration 0 is.
 
-**The value head is nearly useless.** Replaying 320 fresh hands at each saved
-checkpoint and comparing `V(s)` with the GAE return `G`:
+**The value head explains only a few percent of the return variance — and that
+turns out to be the ceiling, not a defect.** Replaying 320 fresh hands at each
+saved checkpoint of run 1 and comparing `V(s)` with the GAE return `G`:
 
 ```text
 ckpt   return std   MSE     explained variance   correlation
@@ -689,23 +744,133 @@ ckpt   return std   MSE     explained variance   correlation
 
 Explained variance is the scale-free version of the value loss
 (`1 - MSE / Var(G)`); `0` means the head is no better than predicting the mean.
-It never exceeds **8.5 %**. So the baseline behind every advantage is almost
-constant, and PPO is running close to a plain policy gradient with all of the
-variance that implies.
+It never exceeds **8.5 %**. The first reading of this was "the critic is broken,
+so the baseline behind every advantage is almost constant and PPO is running
+close to a plain policy gradient". That reading was wrong, and
+`scripts\diagnose_value.py` is what disproved it.
 
 **The value-loss curve is misleading.** It rose from `7.95` to a peak of
 `128.07`, then fell to `60.57`. But the return standard deviation rose to `9.7`
 during the same phase and then fell to `7.9`, so much of the curve is the target
 moving, not the critic getting better or worse. A raw MSE on returns cannot be
-compared across iterations; `explained variance` can.
-
-**The trust region was never the problem.** Approx KL stayed below `0.0076`
-(mean `0.0036`) and the clip fraction below `0.086`, while the pre-clip gradient
-norm reached `15.2` against a limit of `0.5`. The actor update stayed inside its
-trust region; the instability is in the critic.
+compared across iterations.
 
 **Entropy halved** (`1.094 → 0.596`) while evaluation stopped improving, which
 is early convergence rather than useful exploration.
+
+### The critic was already at the ceiling
+
+The offline test fits `V` to returns with no policy loss and no moving target,
+on one fixed collection of 20,000 hands from checkpoint 50: **162,044 training
+decisions, 40,422 held out, split by hand** so that no row from a test hand is
+ever trained on. `scripts\diagnose_value.py --hands 20000` reproduces it; the
+default 4,000 hands reads `+0.025` instead of `+0.030`, which is the same story
+with a wider interval.
+
+Ridge regression on the 131 features, fitted on growing slices of that same
+training set:
+
+```text
+  train hands  decisions   penalty 10  100   1000
+          250      1,290       -0.219  -0.007  0.004
+          500      2,586       -0.105  -0.003  0.007
+        1,000      5,050       -0.010   0.012  0.012
+        2,000     10,139        0.007   0.016  0.017
+        4,000     20,242        0.024   0.026  0.023
+        8,000     40,720        0.028   0.028  0.026
+       31,905    162,044        0.030   0.030  0.030
+```
+
+Eight times more data moves the ceiling from `0.024` to `0.030` and then stops.
+That is the signature of an **information ceiling**, not of a model that needs
+more samples.
+
+Which block carries the signal, at full size:
+
+```text
+  own hole cards (0:52)          0.026
+  public board (52:104)         -0.000
+  raise counts (104:124)         0.004   (inside the scalars)
+  pot, to call, blind (128:131)  0.004
+  everything                     0.030
+```
+
+Per street, the ceiling barely moves: `0.033` preflop, `0.033` flop, `0.029`
+turn, `0.027` river, against outcome spreads of `6.9 → 8.9` bb.
+
+And a bigger model does not find interactions that ridge missed, it only
+memorises. On the same 162k/40k split:
+
+```text
+  MLP 256x2, weight decay 1e-2, best held-out  0.050 at step 1,000
+                                       final   -0.218 at step 20,000
+  MLP 64x1,  weight decay 1e-3, best held-out  0.050 at step 3,000
+                                       final   -0.025 at step 20,000
+```
+
+Train explained variance on those runs reaches `0.65`. A earlier probe on 2,000
+hands showed the same thing more starkly: train `0.96`, held-out `-0.62`.
+
+**So the ceiling is about 3–5 %, and it belongs to the target, not to the
+network.** The reason is in the data: the payoff's *magnitude* is highly
+predictable — `corr(|payoff|, pot)` is `0.26` preflop and `0.78` on the river —
+but its *sign* depends on the opponent's hole cards, which are not observable.
+The conditional mean therefore varies far less than the outcome:
+
+```text
+  Var(V(s))  <=  Var(E[G | s])  ~=  0.03 x Var(G)
+  prediction spread of a perfect critic  ~=  1.4 bb
+  spread of the outcomes themselves      ~=  7.9 bb
+```
+
+That bound is the whole story. Even a perfect critic is only allowed to move
+its baseline by about a big blind and a half, so roughly `97 %` of the variance
+in `G - V(s)` survives no matter what the critic does. **Advantage noise in
+this game is fundamental, and it has to be bought with samples per update — not
+with a better value function.**
+
+It also explains the `0.085` at checkpoint 50, which looks *better* than the
+`0.030` ceiling. It is not: 320 hands is about 1,600 decisions, and an explained
+variance estimated on 1,600 rows has a standard error near `sqrt(2 / 1600)`, or
+`0.035`. The two numbers are the same number.
+
+### What this changed in the code
+
+Two of the three things the diagnosis pointed at were measurement bugs, and both
+are fixed:
+
+* **`value_loss` is now `MSE / Var(G)`**, so it reads as the fraction of return
+  variance left unexplained and `explained_variance = 1 - value_loss`. The
+  critic is compared on one axis across iterations instead of on a number that
+  moves with the policy.
+* **`explained_variance` is logged every iteration**, computed from the rollout's
+  stored values before the update, and plotted instead of the raw loss.
+* **Iteration 0 is evaluated.** The first run's starting point had to be
+  reconstructed from the seed and replayed; the harness now measures it.
+
+One side effect was worth measuring. On a fresh 3,336-decision rollout the raw
+value term was `99.8 %` of the pre-clip gradient norm (`5.07` against `0.087`
+for the policy term), so the global clip at `0.5` was permanently saturated and
+rescaling every minibatch by a factor set by the critic's error. Adam is almost
+invariant to a *constant* rescale, and measured directly, clipping at `0.5`
+versus not clipping changed the summed parameter update by only about `4 %` —
+so this was **not** costing the actor a factor of ten. It is still worth
+removing, because a clip whose factor jumps between minibatches perturbs Adam's
+momentum for reasons that have nothing to do with the policy. With the loss
+normalised the batch reports `0.48`, so the clip is an emergency brake again.
+
+**The network was not changed.** `CardNet`, a shared card embedding with sum
+pooling over the hole and board blocks — the DeepSets shape that matches how
+these features are built — reached `0.029` held out at its best setting, against
+`0.031` for plain ridge on the raw features. Architecture is not where the
+missing variance is. Changing `networks.py` would have been work with no
+mechanism behind it.
+
+**The trust region was never the problem.** Approx KL stayed below `0.0076`
+(mean `0.0036`) and the clip fraction below `0.086`. What looked like
+instability in the critic was the ceiling, and what looked like a saturated
+gradient norm was the critic's loss scale.
+
 
 ### The caveat that limits the result
 
@@ -863,19 +1028,24 @@ otherwise recover at the first decision of a hand.
 
 ## Current limitations
 
-* The first 50-iteration run exists and is reported above, but it is one seed
-  against one passive opponent. It improved `-0.105` → `+0.230` bb/hand and then
-  plateaued after iteration 20.
-* The value head explains only `0–8.5 %` of the return variance. The baseline
-  behind every advantage is nearly constant, so the policy gradient is much
-  noisier than it needs to be. This is the current bottleneck.
-* The training loop has no iteration-0 evaluation, so the starting point is
-  reconstructed rather than logged.
-* The encoder, the policy/value network, the rollout buffer, the PPO update and
-  the training loop all exist; Agent B's history tokens are encoded and unused.
+* Two 50-iteration runs exist and are reported above, but each is one seed
+  against one passive opponent. Run 2 improved `-0.105` → `+0.277` bb/hand, a
+  paired `+0.382 ± 0.150`; the last four evaluations are not resolved from each
+  other.
+* The value target has an **information ceiling of about 3–5 %** of its variance:
+  the payoff's sign depends on hole cards nobody can see. A perfect critic
+  therefore removes only a few percent of the advantage noise, so this is not a
+  bottleneck that can be fixed — variance has to be bought with hands per
+  update.
 * The evaluation opponent calls or checks, so it never folds a bet and never
   raises. It measures "does the agent beat a passive caller", not "is the agent
-  strong". The observed gain is consistent with learning not to fold.
+  strong". The observed gain is consistent with learning not to fold, and it is
+  the most likely reason the curve flattens.
+* Run 1's log has no iteration-0 row, so its starting point is reconstructed
+  rather than logged. Run 2 measures and checkpoints iteration 0.
+* The encoder, the policy/value network, the rollout buffer, the PPO update and
+  the training loop all exist; Agent B's history tokens are encoded and unused.
+
 * The `lambda = 0.95` choice is a starting point, not a measurement: on a
   four-decision hand the terminal shock still reaches the first decision with
   weight `0.95³ ≈ 0.86`.
@@ -892,15 +1062,15 @@ otherwise recover at the first decision of a hand.
 | Stage | Work | Status |
 |---|---|---|
 | 1 | Verify simulator; document observations, actions, payoffs and history; encode Agent B's tokens | ✅ done |
-| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **in progress — trains and improves, but the critic is weak** |
+| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **in progress — trains and improves against one passive opponent** |
 | 3 | Agent B: MLP + GRU over betting history, trained with PPO | planned |
 | 4 | Head-to-head evaluation, ablations and results write-up | planned |
 
-**Recommended next milestone: diagnose the value head.**
-
-The first full run improved from `-0.105` to `+0.230` bb/hand and then
-plateaued, while the critic explained at most `8.5 %` of the return variance.
-Agent B would inherit the same broken baseline, so this comes first.
+**Recommended next milestone: make the opponent worth beating, and measure how
+much a hand is worth.** The value head turned out to be at its information
+ceiling, so it is not the bottleneck. Two things are: the evaluation opponent
+never folds or raises, so the best available response is degenerate, and a
+`320`-hand rollout gives PPO only ~2,400 gradient steps over the whole run.
 
 A sensible remaining Stage 2 scope:
 
@@ -915,10 +1085,16 @@ A sensible remaining Stage 2 scope:
 5. ~~Build the training loop, CSV logging, periodic checkpoints.~~ ✅
 6. ~~Add a fixed-seed evaluation harness with confidence intervals.~~ ✅
 7. ~~Run the full 50-iteration job and plot the curve.~~ ✅
-8. Add an iteration-0 evaluation and log `explained variance` per iteration, so
-   the critic's quality is measured on the same axis throughout.
-9. Sanity-check the value head offline: on one fixed batch, fit `V` with plain
-   supervised regression for many steps. If that cannot reach high explained
-   variance, the problem is the features or the architecture, not PPO.
-10. Only after the baseline is useful, add the GRU history encoder for Agent B
-    and compare the two under the same evaluation protocol.
+8. ~~Add an iteration-0 evaluation and log `explained variance` per iteration, so
+   the critic's quality is measured on the same axis throughout.~~ ✅
+9. ~~Sanity-check the value head offline: on one fixed dataset, fit `V` with
+   plain supervised regression.~~ ✅ Answer: the ceiling is `3–5 %` of the return
+   variance and a card-embedding network reaches the same place as ridge, so the
+   features and the architecture are not the limit.
+10. Add a second scripted opponent that raises, and evaluate against both. Until
+    then every number measures "beats a caller", which is not a poker claim.
+11. Raise `hands_per_iteration` from `320` and watch whether `explained variance`
+    holds at the ceiling while the evaluation interval shrinks. The advantage
+    noise is irreducible, so samples per update are the only lever on it.
+12. Only after that, add the GRU history encoder for Agent B and compare the two
+    under the same evaluation protocol.

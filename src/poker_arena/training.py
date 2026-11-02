@@ -11,10 +11,13 @@ is the thing being trained, but the mode is what a fixed-seed comparison should
 measure: sampling would add hand-to-hand noise on top of the deal noise and make
 two runs with the same seed diverge for no reason.
 
-"One number per hand" is also why the report prints a confidence interval.  A
-hand's payoff has a standard deviation of roughly 2.4 big blinds, so a few
-thousand hands cannot resolve a small edge.  The interval says what the sample
-actually supports; a point estimate alone invites reading noise as progress.
+"One number per hand" is also why the report prints a confidence interval.  The
+spread is not a property of the game: it follows how many chips the current
+policy puts in, and measured `1.6` bb at iteration 10 against `5.1` bb at
+iteration 50 of the first run.  At the larger of those, 2,000 hands resolve only
+about `0.22` bb/hand.  The interval is computed from the sample actually
+observed and says what that sample supports; a point estimate alone invites
+reading noise as progress.
 """
 
 from __future__ import annotations
@@ -138,6 +141,8 @@ TRAIN_FIELDS = (
     "decisions",
     "policy_loss",
     "value_loss",
+    "explained_variance",
+    "return_std",
     "entropy",
     "total_loss",
     "approx_kl",
@@ -301,6 +306,44 @@ def train(
         train_writer.writeheader()
         evaluation_writer.writeheader()
 
+        def record_evaluation(iteration: int) -> EvaluationRecord:
+            """Evaluate, log the row and write a checkpoint."""
+
+            result = evaluate(
+                net,
+                int(config.evaluation_hands),
+                seed=int(config.evaluation_seed),
+            )
+            record = EvaluationRecord(iteration=iteration, result=result)
+            evaluations.append(record)
+            evaluation_writer.writerow(
+                {
+                    "iteration": iteration,
+                    "hands": result.hands,
+                    "opponent": result.opponent,
+                    "mean_bb": result.mean_bb,
+                    "stderr_bb": result.stderr_bb,
+                    "ci95_bb": result.ci95_bb,
+                    "total_bb": result.total_bb,
+                }
+            )
+            eval_handle.flush()
+
+            path = save_checkpoint(
+                net,
+                config,
+                iteration,
+                Path(config.checkpoint_dir)
+                / f"{config.run_name}_{iteration:04d}.pt",
+            )
+            checkpoints.append(path)
+            return record
+
+        # Iteration 0 is a real measurement of the starting network.  Without
+        # it the first reported change needs a reconstructed network and a
+        # replayed evaluation, which is work the harness should be doing.
+        record_evaluation(0)
+
         for iteration in range(1, int(config.iterations) + 1):
             trajectories = collect_trajectories(
                 env,
@@ -330,34 +373,7 @@ def train(
                 iteration % int(config.evaluation_every) == 0
                 or iteration == int(config.iterations)
             ):
-                result = evaluate(
-                    net,
-                    int(config.evaluation_hands),
-                    seed=int(config.evaluation_seed),
-                )
-                record = EvaluationRecord(iteration=iteration, result=result)
-                evaluations.append(record)
-                evaluation_writer.writerow(
-                    {
-                        "iteration": iteration,
-                        "hands": result.hands,
-                        "opponent": result.opponent,
-                        "mean_bb": result.mean_bb,
-                        "stderr_bb": result.stderr_bb,
-                        "ci95_bb": result.ci95_bb,
-                        "total_bb": result.total_bb,
-                    }
-                )
-                eval_handle.flush()
-
-                path = save_checkpoint(
-                    net,
-                    config,
-                    iteration,
-                    Path(config.checkpoint_dir)
-                    / f"{config.run_name}_{iteration:04d}.pt",
-                )
-                checkpoints.append(path)
+                record = record_evaluation(iteration)
 
             if progress is not None:
                 progress(row, record)

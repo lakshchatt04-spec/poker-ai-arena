@@ -8,6 +8,13 @@ Every ``--eval-every`` iterations (and on the final iteration) the current
 network plays ``--eval-hands`` hands against a scripted call/check opponent,
 using the same deals and the same seed every time.  A per-hand payoff is noisy,
 so the evaluation column is a mean with a 95 % interval, never a bare number.
+Iteration 0 is evaluated too, so the starting point is measured rather than
+reconstructed.
+
+``value`` is the mean squared value error divided by the rollout's return
+variance, so ``0`` is a perfect critic and ``1`` predicts the mean.  ``EV`` is
+the explained variance of the critic that *collected* the rollout.  Neither is a
+raw big-blind number, because those are not comparable between iterations.
 
 Results are written to ``runs/<run-name>_train.csv``,
 ``runs/<run-name>_eval.csv`` and ``checkpoints/<run-name>_<iter>.pt``.
@@ -100,7 +107,8 @@ def _format_row(row: dict[str, float | int]) -> str:
         f"{int(row['iteration']):>5}"
         f"{int(row['decisions']):>11}"
         f"{float(row['policy_loss']):>9.4f}"
-        f"{float(row['value_loss']):>10.4f}"
+        f"{float(row['value_loss']):>8.4f}"
+        f"{float(row['explained_variance']):>8.2f}"
         f"{float(row['entropy']):>9.4f}"
         f"{float(row['approx_kl']):>8.4f}"
         f"{float(row['clip_fraction']):>7.2f}"
@@ -130,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
     print()
 
     print(
-        f"{'iter':>5}{'decisions':>11}{'policy':>9}{'value':>10}"
+        f"{'iter':>5}{'decisions':>11}{'policy':>9}{'value':>8}{'EV':>8}"
         f"{'entropy':>9}{'KL':>8}{'clip':>7}{'grad':>7}"
     )
 

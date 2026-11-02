@@ -190,7 +190,9 @@ def test_train_writes_one_row_per_iteration_and_its_csvs(tmp_path):
 
     with open(result.evaluation_log, newline="", encoding="utf-8") as handle:
         evaluation_rows = list(csv.DictReader(handle))
-    assert len(evaluation_rows) == 2
+    # iteration 0 plus the two scheduled iterations
+    assert len(evaluation_rows) == 3
+    assert int(evaluation_rows[0]["iteration"]) == 0
     assert all(row["opponent"] == "scripted" for row in evaluation_rows)
 
 
@@ -199,12 +201,27 @@ def test_train_evaluates_on_the_final_iteration_even_off_schedule(tmp_path):
 
     result = train(config)
 
-    assert [record.iteration for record in result.evaluations] == [2, 3]
-    assert len(result.checkpoints) == 2
+    assert [record.iteration for record in result.evaluations] == [0, 2, 3]
+    assert len(result.checkpoints) == 3
+    assert result.checkpoints[0].endswith("_0000.pt")
     assert all(path.endswith(".pt") for path in result.checkpoints)
     assert all(
         isinstance(record, EvaluationRecord) for record in result.evaluations
     )
+
+
+def test_the_initial_evaluation_measures_the_starting_network(tmp_path):
+    """Iteration 0 must play the untouched network, not a trained one."""
+
+    net = _new_net()
+    pristine = copy.deepcopy(net)
+
+    result = train(_tiny_config(tmp_path, iterations=1), net=net)
+
+    assert [record.iteration for record in result.evaluations] == [0, 1]
+
+    expected = evaluate(pristine, hands=12, seed=777)
+    assert result.evaluations[0].result == expected
 
 
 def test_train_changes_the_weights(tmp_path):

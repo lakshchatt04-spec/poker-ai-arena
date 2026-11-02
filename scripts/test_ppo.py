@@ -110,6 +110,11 @@ def main() -> int:
         buffer.add_trajectory(trajectory)
     batch = buffer.batch()
 
+    #: The stored log-probs came from these weights.  Section 3 updates ``net`` in
+    #: place, so the later "fresh log-probs" check must clone from here; cloning
+    #: ``net`` after the update would test a stale policy and call it fresh.
+    pristine = _clone(net)
+
     payoffs = np.array([t.final_payoff for t in trajectories])
     print(f"trajectories        : {len(trajectories)}")
     print(f"decisions           : {len(batch)}")
@@ -140,6 +145,8 @@ def main() -> int:
     for key in (
         "policy_loss",
         "value_loss",
+        "explained_variance",
+        "return_std",
         "entropy",
         "total_loss",
         "approx_kl",
@@ -147,11 +154,19 @@ def main() -> int:
         "grad_norm",
     ):
         print(f"{key:<24} {stats[key]:>10.4f}")
+    print()
+    print("value_loss is MSE / Var(return), so it is the fraction of return")
+    print("variance left unexplained; explained_variance = 1 - value_loss.")
 
     print()
     print(f"{'metric':<24} {'before':>10} {'after':>10} {'change':>10}")
-    for key in ("entropy", "value_loss", "mean_value", "mean_log_prob"):
-        print(f"{key:<24} {before[key]:>10.4f} {after[key]:>10.4f} "
+    for key, label in (
+        ("entropy", "entropy"),
+        ("value_loss", "raw MSE (bb^2)"),
+        ("mean_value", "mean value (bb)"),
+        ("mean_log_prob", "mean log prob"),
+    ):
+        print(f"{label:<24} {before[key]:>10.4f} {after[key]:>10.4f} "
               f"{after[key] - before[key]:>+10.4f}")
 
     parameter_delta = sum(
@@ -172,8 +187,8 @@ def main() -> int:
 
     # ------------------------------------------------------------------
     _header("[4] The trust region: fresh vs stale log-probabilities")
-    fresh_net = _clone(net)
-    stale_net = _clone(net)
+    fresh_net = _clone(pristine)
+    stale_net = _clone(pristine)
     fresh_stats = PPOUpdater(
         fresh_net, PPOConfig(epochs=1, minibatch_size=len(batch)), seed=0
     ).step(batch)
@@ -222,10 +237,11 @@ def main() -> int:
     _header("[6] API summary")
     print("updater = PPOUpdater(net, PPOConfig(), seed=0)")
     print("stats = updater.step(buffer.batch())")
-    print("stats keys: policy_loss, value_loss, entropy, total_loss,")
-    print("            approx_kl, clip_fraction, grad_norm, epochs,")
-    print("            minibatches, samples")
-    print("advantages are normalised once per rollout; returns stay raw")
+    print("stats keys: policy_loss, value_loss, explained_variance,")
+    print("            return_std, entropy, total_loss, approx_kl,")
+    print("            clip_fraction, grad_norm, epochs, minibatches, samples")
+    print("advantages are normalised once per rollout; returns are divided by")
+    print("their rollout standard deviation before the value loss")
     print("log_probs from the buffer are treated as constants")
 
     print("\nAll PPO checks passed.")
