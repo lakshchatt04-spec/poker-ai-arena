@@ -44,6 +44,7 @@ poker-ai-arena/
 │   ├── test_networks.py            # executable network report
 │   ├── test_ppo.py                 # executable PPO-update report
 │   ├── test_rollout.py             # executable rollout / GAE report
+│   ├── plot_training.py            # reads a run's CSVs, writes a PNG
 │   └── train_agent_a.py            # trains Agent A and evaluates it
 ├── tests/
 │   ├── conftest.py                 # puts src/ on sys.path for pytest
@@ -55,6 +56,8 @@ poker-ai-arena/
 │   ├── test_rollout.py             # rollout and GAE tests
 │   └── test_training.py            # training-loop and evaluation tests
 ├── .venv/                          # local environment (git-ignored)
+├── docs/
+│   └── agent_a_curve.png           # figure from the first full run
 ├── .gitignore
 ├── pytest.ini                      # limits collection to tests/
 ├── requirements.txt
@@ -115,6 +118,9 @@ python -m pytest -q
 
 # Train Agent A, then evaluate as it goes.
 python scripts\train_agent_a.py
+
+# Plot the run's CSV logs to runs\agent_a_curve.png.
+python scripts\plot_training.py
 ```
 
 Without activation:
@@ -533,7 +539,7 @@ cycle.
 
 ```text
 for iteration in 1..N:
-    collect 320 self-play hands                 -> ~1,000 decisions
+    collect 320 self-play hands                 -> ~1,000-4,000 decisions
     RolloutBuffer.batch()                       -> raw advantages, returns
     PPOUpdater.step()                           -> one update, 4 epochs
     write the diagnostics row to CSV
@@ -541,6 +547,9 @@ for iteration in 1..N:
         evaluate 2,000 fixed-seed hands vs a scripted opponent
         write the evaluation row and a checkpoint
 ```
+
+The decision count is not constant: it depends on how long the current policy
+keeps a hand alive, which changes as it learns.
 
 ### Why evaluation is separate from the training reward
 
@@ -557,22 +566,28 @@ with the same seed diverge for no reason.
 
 ### How many hands does a measurement need?
 
-A hand's payoff is around `±11` bb and its standard deviation is roughly `2.4`
-bb. The 95 % interval for `n` hands is `1.96 × 2.4 / sqrt(n)`:
+The per-hand standard deviation is **not a property of the game** — it depends on
+how many chips the current policy puts in. In the first run it was `1.6` bb at
+iteration 10 and `5.1` bb at iteration 50. The 95 % interval is
+`1.96 × σ / sqrt(n)`:
 
-| Hands | 95 % interval (bb/hand) |
-|---|---|
-| 500 | `±0.211` |
-| 2,000 | `±0.105` |
-| 8,900 | `±0.050` |
-| 20,000 | `±0.033` |
+| Hands | Interval at σ = 1.6 | Interval at σ = 5.1 |
+|---|---|---|
+| 500 | `±0.140` | `±0.446` |
+| 2,000 | `±0.070` | `±0.223` |
+| 10,000 | `±0.031` | `±0.100` |
+| 40,000 | `±0.016` | `±0.050` |
 
-So an edge of `0.05` bb/hand needs roughly nine thousand hands before it is
-distinguishable from zero, and 2,000 hands can only resolve effects of about
-`0.1` bb. This is why the script prints the interval next to every evaluation
-and why a small movement between two checkpoint evaluations should not be read
-as progress. It also rules out the training reward as a progress signal: it is
-one noisy sample per iteration, from a moving opponent and a changing policy.
+So against the trained policy, resolving a `0.05` bb edge needs about **40,000**
+hands, not the ~9,000 an earlier estimate of σ ≈ 2.4 bb suggested. That estimate
+came from the untrained policy, which played short, small pots. The harness
+computes `stderr` from the sample it actually observed, so the printed interval
+stays correct; only the planning number was wrong.
+
+This is also why the interval is printed next to every evaluation and why a
+small movement between checkpoints should not be read as progress. It rules out
+the training reward as a progress signal too: it is one noisy sample per
+iteration, from a moving opponent and a changing policy.
 
 ### Outputs
 
@@ -605,6 +620,99 @@ training mode, the checkpoint round-trip and its metadata, the row, evaluation
 and checkpoint counts, CSV contents, evaluation on the final iteration when it
 is off schedule, that training changes the weights, the progress callback order,
 and full-run reproducibility.
+
+---
+
+## First training run: 50 iterations
+
+```powershell
+python scripts\train_agent_a.py      # seed 0, 320 hands/iteration, 2,000-hand evaluation every 10
+python scripts\plot_training.py      # -> runs\agent_a_curve.png
+```
+
+The full run took a few minutes on CPU and produced 159,035 decisions.
+
+| Iteration | Decisions | Value loss | Entropy | Eval (bb/hand) | 95 % |
+|---|---|---|---|---|---|
+| 1 | 945 | 7.95 | 1.094 | — | — |
+| 10 | 3,399 | 78.33 | 0.733 | −0.040 | ±0.069 |
+| 15 | 4,150 | **128.07** (peak) | 0.617 | — | — |
+| 20 | 3,567 | 78.50 | 0.671 | **+0.292** | ±0.172 |
+| 30 | 3,354 | 56.77 | 0.633 | +0.223 | ±0.225 |
+| 40 | 3,200 | 55.18 | 0.583 | +0.161 | ±0.241 |
+| 50 | 3,229 | 60.57 | 0.596 | +0.230 | ±0.223 |
+
+![Agent A's first 50-iteration training run](docs/agent_a_curve.png)
+
+The plot is written by `scripts/plot_training.py`; the copy above is the seed-0
+run.
+
+### What improved
+
+There is no iteration-0 evaluation — a gap in the harness. Reconstructing the
+initial network (same seed, `torch.manual_seed(0)` then `PolicyValueNet()`) and
+replaying the same 2,000 deals gives:
+
+```text
+initial net   : -0.1050 bb/hand  (+/- 0.1411)
+final net     : +0.2295 bb/hand  (+/- 0.2228)
+paired change : +0.3345 bb/hand  (+/- 0.1539 paired 95%)
+```
+
+The unpaired intervals overlap, but pairing the same deal removes most of the
+variance: the paired interval excludes zero, so the improvement is resolved even
+though neither individual measurement is precise to 0.33 bb. That is the whole
+argument for fixed-seed evaluation, and for pairing rather than comparing two
+independent means.
+
+Decisions per hand rose from **3.0 to 10.1**: the agent stopped folding and
+started playing hands to the end. Against an opponent that never folds, that is
+the correct direction.
+
+### What did not
+
+**It plateaued at iteration 20.** Evaluations 20 → 50 are statistically
+indistinguishable, and the best point estimate is the first one after the
+fast-learning phase.
+
+**The value head is nearly useless.** Replaying 320 fresh hands at each saved
+checkpoint and comparing `V(s)` with the GAE return `G`:
+
+```text
+ckpt   return std   MSE     explained variance   correlation
+  10       9.73     92.04        0.028             0.189
+  20       9.10     83.17       -0.004             0.113
+  30       8.69     73.38        0.029             0.191
+  40       8.35     68.92        0.010             0.174
+  50       7.93     57.58        0.085             0.300
+```
+
+Explained variance is the scale-free version of the value loss
+(`1 - MSE / Var(G)`); `0` means the head is no better than predicting the mean.
+It never exceeds **8.5 %**. So the baseline behind every advantage is almost
+constant, and PPO is running close to a plain policy gradient with all of the
+variance that implies.
+
+**The value-loss curve is misleading.** It rose from `7.95` to a peak of
+`128.07`, then fell to `60.57`. But the return standard deviation rose to `9.7`
+during the same phase and then fell to `7.9`, so much of the curve is the target
+moving, not the critic getting better or worse. A raw MSE on returns cannot be
+compared across iterations; `explained variance` can.
+
+**The trust region was never the problem.** Approx KL stayed below `0.0076`
+(mean `0.0036`) and the clip fraction below `0.086`, while the pre-clip gradient
+norm reached `15.2` against a limit of `0.5`. The actor update stayed inside its
+trust region; the instability is in the critic.
+
+**Entropy halved** (`1.094 → 0.596`) while evaluation stopped improving, which
+is early convergence rather than useful exploration.
+
+### The caveat that limits the result
+
+The evaluation opponent calls or checks and never folds or raises. Beating it
+means "loses less to a passive caller", not "plays well". The observed gain is
+consistent with learning not to fold, which is a degenerate best response. A
+raising opponent is needed before any play-quality claim.
 
 ---
 
@@ -755,13 +863,19 @@ otherwise recover at the first decision of a hand.
 
 ## Current limitations
 
-* No trained agent yet. The training loop and evaluation harness exist and are
-  tested, but no long run has been done, so there are no results to report.
+* The first 50-iteration run exists and is reported above, but it is one seed
+  against one passive opponent. It improved `-0.105` → `+0.230` bb/hand and then
+  plateaued after iteration 20.
+* The value head explains only `0–8.5 %` of the return variance. The baseline
+  behind every advantage is nearly constant, so the policy gradient is much
+  noisier than it needs to be. This is the current bottleneck.
+* The training loop has no iteration-0 evaluation, so the starting point is
+  reconstructed rather than logged.
 * The encoder, the policy/value network, the rollout buffer, the PPO update and
   the training loop all exist; Agent B's history tokens are encoded and unused.
 * The evaluation opponent calls or checks, so it never folds a bet and never
   raises. It measures "does the agent beat a passive caller", not "is the agent
-  strong". A stronger baseline is needed before any claim about play quality.
+  strong". The observed gain is consistent with learning not to fold.
 * The `lambda = 0.95` choice is a starting point, not a measurement: on a
   four-decision hand the terminal shock still reaches the first decision with
   weight `0.95³ ≈ 0.86`.
@@ -778,11 +892,15 @@ otherwise recover at the first decision of a hand.
 | Stage | Work | Status |
 |---|---|---|
 | 1 | Verify simulator; document observations, actions, payoffs and history; encode Agent B's tokens | ✅ done |
-| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **in progress — all components built; needs a real training run** |
+| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **in progress — trains and improves, but the critic is weak** |
 | 3 | Agent B: MLP + GRU over betting history, trained with PPO | planned |
 | 4 | Head-to-head evaluation, ablations and results write-up | planned |
 
-**Recommended next milestone: actually train Agent A and read the curve.**
+**Recommended next milestone: diagnose the value head.**
+
+The first full run improved from `-0.105` to `+0.230` bb/hand and then
+plateaued, while the critic explained at most `8.5 %` of the return variance.
+Agent B would inherit the same broken baseline, so this comes first.
 
 A sensible remaining Stage 2 scope:
 
@@ -794,13 +912,13 @@ A sensible remaining Stage 2 scope:
 4. ~~Implement the PPO update: clipped ratio, entropy bonus, value-loss
    coefficient ≈ 0.5, advantage and return normalisation, global gradient-norm
    clipping.~~ ✅
-5. ~~Build the training loop: alternate rollout collection and updates, log the
-   diagnostics already returned by `PPOUpdater.step()`, checkpoint
-   periodically.~~ ✅
+5. ~~Build the training loop, CSV logging, periodic checkpoints.~~ ✅
 6. ~~Add a fixed-seed evaluation harness with confidence intervals.~~ ✅
-7. Run the full 50-iteration training job (one measured iteration — 320 hands,
-   update and a 200-hand evaluation — takes about 10 seconds including startup,
-   so the full run is a few minutes on CPU) and inspect the value loss, entropy
-   and evaluation interval before drawing any conclusion.
-8. Only after Agent A is stable, add the GRU history encoder for Agent B and
-   compare the two under the same evaluation protocol.
+7. ~~Run the full 50-iteration job and plot the curve.~~ ✅
+8. Add an iteration-0 evaluation and log `explained variance` per iteration, so
+   the critic's quality is measured on the same axis throughout.
+9. Sanity-check the value head offline: on one fixed batch, fit `V` with plain
+   supervised regression for many steps. If that cannot reach high explained
+   variance, the problem is the features or the architecture, not PPO.
+10. Only after the baseline is useful, add the GRU history encoder for Agent B
+    and compare the two under the same evaluation protocol.
