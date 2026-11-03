@@ -11,12 +11,16 @@ import torch
 
 from poker_arena.networks import PolicyValueNet
 from poker_arena.training import (
+    OPPONENT_NAMES,
     Z_95,
     EvaluationRecord,
     EvaluationResult,
     TrainingConfig,
     evaluate,
+    hole_strength,
     load_checkpoint,
+    make_opponent,
+    raising_opponent,
     random_opponent,
     save_checkpoint,
     scripted_opponent,
@@ -51,6 +55,13 @@ def test_default_config_is_pinned():
 
     assert config.iterations == 50
     assert config.hands_per_iteration == 320
+    assert config.self_play_fraction == 0.5
+    assert config.training_opponent == "raiser_strong"
+    assert config.evaluation_opponents == (
+        "passive",
+        "raiser_strong",
+        "raiser_loose",
+    )
     assert config.evaluation_every == 10
     assert config.evaluation_hands == 2_000
     assert config.seed == 0
@@ -66,6 +77,11 @@ def test_default_config_is_pinned():
     [
         {"iterations": 0},
         {"hands_per_iteration": 0},
+        {"self_play_fraction": -0.1},
+        {"self_play_fraction": 1.5},
+        {"training_opponent": "nope"},
+        {"evaluation_opponents": ()},
+        {"evaluation_opponents": ("passive", "nope")},
         {"evaluation_every": 0},
         {"evaluation_hands": 1},
         {"run_name": "   "},
@@ -96,6 +112,66 @@ def test_random_opponent_is_seeded_and_always_legal():
     assert set(left) <= set(state["legal_actions"])
 
 
+def test_hole_strength_ranks_cards_without_a_full_evaluator():
+    def strength(*cards: str) -> float:
+        return hole_strength({"raw_obs": {"hand": list(cards)}})
+
+    trash = strength("S2", "H7")
+    suited = strength("SA", "SK")  # two big cards, same suit
+    pair = strength("S7", "H7")
+
+    assert 0.0 <= trash < suited
+    assert pair > trash
+    # Missing or malformed cards must not crash a scripted bot.
+    assert hole_strength({}) == 0.0
+    assert hole_strength({"raw_obs": {"hand": ["bad"]}}) == 0.0
+
+
+def test_raising_opponent_raises_only_when_told_and_otherwise_checks():
+    always = raising_opponent(lambda state: True)
+    never = raising_opponent(lambda state: False)
+
+    assert always({"legal_actions": [0, 1, 2]}, 1) == 1
+    assert always({"legal_actions": [0, 2]}, 1) == 0  # no raise available: call
+    assert never({"legal_actions": [1, 2, 3]}, 1) == 3  # check before fold
+    assert never({"legal_actions": [1, 2]}, 1) == 2
+
+
+def test_make_opponent_builds_the_named_style():
+    strong = make_opponent("raiser_strong")
+    weak_state = {"raw_obs": {"hand": ["S2", "H7"]}, "legal_actions": [0, 1, 2]}
+    strong_state = {"raw_obs": {"hand": ["SA", "SK"]}, "legal_actions": [0, 1, 2]}
+
+    assert make_opponent("passive") is scripted_opponent
+    assert strong(weak_state, 1) == 0  # trash: call, do not raise
+    assert strong(strong_state, 1) == 1  # premium: raise
+
+
+def test_loose_raiser_is_reproducible_and_card_independent():
+    first = make_opponent("raiser_loose", seed=4)
+    second = make_opponent("raiser_loose", seed=4)
+
+    state = {"raw_obs": {"hand": ["S2", "H7"]}, "legal_actions": [0, 1, 2]}
+    left = [first(state, 1) for _ in range(2_000)]
+    right = [second(state, 1) for _ in range(2_000)]
+
+    assert left == right
+    raise_rate = sum(action == 1 for action in left) / len(left)
+    assert raise_rate == pytest.approx(0.35, abs=0.05)
+
+
+def test_make_opponent_rejects_an_unknown_name():
+    with pytest.raises(ValueError, match="unknown opponent"):
+        make_opponent("nope")
+
+    assert set(OPPONENT_NAMES) == {
+        "passive",
+        "raiser_strong",
+        "raiser_loose",
+        "random",
+    }
+
+
 # -- evaluation ------------------------------------------------------------
 def test_evaluate_reports_finite_statistics_and_a_z_interval():
     net = _new_net()
@@ -104,7 +180,7 @@ def test_evaluate_reports_finite_statistics_and_a_z_interval():
 
     assert isinstance(result, EvaluationResult)
     assert result.hands == 200
-    assert result.opponent == "scripted"
+    assert result.opponent == "passive"
     assert np.isfinite(result.mean_bb)
     assert np.isfinite(result.stderr_bb)
     assert result.stderr_bb >= 0.0
@@ -190,10 +266,14 @@ def test_train_writes_one_row_per_iteration_and_its_csvs(tmp_path):
 
     with open(result.evaluation_log, newline="", encoding="utf-8") as handle:
         evaluation_rows = list(csv.DictReader(handle))
-    # iteration 0 plus the two scheduled iterations
-    assert len(evaluation_rows) == 3
-    assert int(evaluation_rows[0]["iteration"]) == 0
-    assert all(row["opponent"] == "scripted" for row in evaluation_rows)
+    # iteration 0 plus the two scheduled iterations, one row per opponent
+    assert len(evaluation_rows) == 9
+    assert [int(row["iteration"]) for row in evaluation_rows] == [
+        0, 0, 0, 1, 1, 1, 2, 2, 2
+    ]
+    assert [row["opponent"] for row in evaluation_rows] == list(
+        config.evaluation_opponents
+    ) * 3
 
 
 def test_train_evaluates_on_the_final_iteration_even_off_schedule(tmp_path):
@@ -201,7 +281,9 @@ def test_train_evaluates_on_the_final_iteration_even_off_schedule(tmp_path):
 
     result = train(config)
 
-    assert [record.iteration for record in result.evaluations] == [0, 2, 3]
+    assert [record.iteration for record in result.evaluations] == [
+        0, 0, 0, 2, 2, 2, 3, 3, 3
+    ]
     assert len(result.checkpoints) == 3
     assert result.checkpoints[0].endswith("_0000.pt")
     assert all(path.endswith(".pt") for path in result.checkpoints)
@@ -218,7 +300,7 @@ def test_the_initial_evaluation_measures_the_starting_network(tmp_path):
 
     result = train(_tiny_config(tmp_path, iterations=1), net=net)
 
-    assert [record.iteration for record in result.evaluations] == [0, 1]
+    assert [record.iteration for record in result.evaluations] == [0, 0, 0, 1, 1, 1]
 
     expected = evaluate(pristine, hands=12, seed=777)
     assert result.evaluations[0].result == expected
@@ -237,15 +319,39 @@ def test_train_changes_the_weights(tmp_path):
     assert any(changed)
 
 
-def test_train_reports_every_iteration_to_the_callback(tmp_path):
-    seen: list[tuple[int, int | None]] = []
+@pytest.mark.parametrize("fraction", [0.0, 1.0])
+def test_train_accepts_the_edges_of_the_mixture(tmp_path, fraction):
+    config = _tiny_config(
+        tmp_path,
+        iterations=1,
+        self_play_fraction=fraction,
+        evaluation_opponents=("passive",),
+    )
 
-    def progress(row, record):
-        seen.append((int(row["iteration"]), None if record is None else record.iteration))
+    result = train(config)
+
+    assert len(result.iterations) == 1
+    assert all(np.isfinite(row["total_loss"]) for row in result.iterations)
+    assert [record.result.opponent for record in result.evaluations] == [
+        "passive", "passive"
+    ]
+
+
+def test_train_reports_every_iteration_to_the_callback(tmp_path):
+    seen: list[tuple[int, tuple[int, ...] | None]] = []
+
+    def progress(row, records):
+        seen.append(
+            (
+                int(row["iteration"]),
+                None if records is None
+                else tuple(record.iteration for record in records),
+            )
+        )
 
     train(_tiny_config(tmp_path, iterations=3, evaluation_every=2), progress=progress)
 
-    assert seen == [(1, None), (2, 2), (3, 3)]
+    assert seen == [(1, None), (2, (2, 2, 2)), (3, (3, 3, 3))]
 
 
 def test_train_is_reproducible_from_the_same_config(tmp_path):

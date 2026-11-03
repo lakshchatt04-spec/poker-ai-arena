@@ -13,9 +13,12 @@ Two agents will eventually be trained with PPO and compared:
 **Research question:** *Does recurrent memory of opponent actions improve
 reinforcement-learning performance in heads-up poker?*
 
-**Current stage: Stage 1 — the simulator contract is verified, and Agent B's
-betting-history encoding is implemented and tested. There is no neural network,
-PPO, GRU, self-play or opponent-modelling code yet.**
+**Current stage: Stage 2 in progress.** Stage 1 verified the simulator contract and
+implemented Agent B's betting-history encoding. Agent A now trains with PPO on a
+mixture of self-play and a strong scripted raiser, and is evaluated on three
+fixed opponents: a passive caller, that raiser, and a held-out raiser with a
+different style. Run 3 improved against all three, including the held-out one.
+Agent B's GRU is still unused.
 
 Stage 1 exists so later results are not built on guesses about RLCard's
 observations, actions, payoffs or history handling. The history encoding is data
@@ -58,7 +61,8 @@ poker-ai-arena/
 │   └── test_training.py            # training-loop and evaluation tests
 ├── .venv/                          # local environment (git-ignored)
 ├── docs/
-│   └── agent_a_curve.png           # figure from the second full run
+│   ├── agent_a_curve.png           # figure from the second full run
+│   └── agent_a_v3_curve.png        # figure from the third full run
 ├── .gitignore
 ├── pytest.ini                      # limits collection to tests/
 ├── requirements.txt
@@ -120,8 +124,8 @@ python -m pytest -q
 # Train Agent A, then evaluate as it goes.
 python scripts\train_agent_a.py
 
-# Plot that run's CSV logs to runs\agent_a_curve.png.
-python scripts\plot_training.py
+# Plot that run's CSV logs to runs\<run-name>_curve.png.
+python scripts\plot_training.py --run-name agent_a_v3
 
 # Diagnose how much of the value target is predictable at all.
 python scripts\diagnose_value.py
@@ -551,19 +555,51 @@ cycle.
 `training.py` connects the pieces without adding a new dependency:
 
 ```text
-evaluate 2,000 fixed-seed hands vs a scripted opponent   (iteration 0)
+evaluate 2,000 fixed-seed hands vs each evaluation opponent   (iteration 0)
 for iteration in 1..N:
-    collect 320 self-play hands                 -> ~1,000-4,000 decisions
+    collect 160 self-play hands                 -> both seats recorded
+    collect 160 hands vs the training opponent  -> learner's seat recorded
     RolloutBuffer.batch()                       -> raw advantages, returns
     PPOUpdater.step()                           -> one update, 4 epochs
     write the diagnostics row to CSV
     every 10 iterations, and on the last one:
-        evaluate 2,000 fixed-seed hands vs a scripted opponent
-        write the evaluation row and a checkpoint
+        for each evaluation opponent:
+            evaluate 2,000 fixed-seed hands
+            write the evaluation row
+        write one checkpoint
 ```
 
 The decision count is not constant: it depends on how long the current policy
 keeps a hand alive, which changes as it learns.
+
+### Why the rollout is a mixture
+
+Training against one scripted opponent invites pattern-matching instead of poker.
+Training only against itself can never discover a raise the policy would not
+invent on its own. The rollout therefore spends half its hands in self-play
+(both seats recorded, so the network sees the game from both sides) and half
+against a scripted opponent. Both halves feed **one** PPO update, so the two
+kinds of experience share a value scale instead of alternating between two
+objectives.
+
+`--self-play-fraction` sets the split; `--training-opponent` picks the scripted
+bot. The defaults are `0.5` and `raiser_strong`, which raises only hole cards its
+simple score likes.
+
+### Why there are three evaluation columns
+
+Evaluation only answers a useful question if the opponent is not the one being
+trained against:
+
+| Opponent | Style | Job in the report |
+|---|---|---|
+| `passive` | always calls or checks | continuity ruler: every earlier run was measured against it |
+| `raiser_strong` | raises only strong hole cards | exploitation reference, and the default training opponent |
+| `raiser_loose` | raises a fixed 35 % of the time, regardless of cards | **held-out generalisation ruler**; never used for training |
+
+A rising `raiser_strong` column can mean "solved the bot". A rising
+`raiser_loose` column cannot: it differs in style, not just aggression, and the
+network has never seen it. That is the column that tests transfer.
 
 ### Why evaluation is separate from the training reward
 
@@ -608,7 +644,7 @@ iteration, from a moving opponent and a changing policy.
 | File | Contents |
 |---|---|
 | `runs/<run-name>_train.csv` | one row per iteration: decisions, losses, entropy, KL, clip fraction, gradient norm, minibatches, samples |
-| `runs/<run-name>_eval.csv` | one row per evaluation: hands, opponent, mean bb, standard error, 95 % interval, total bb |
+| `runs/<run-name>_eval.csv` | one row per evaluation **per opponent**: hands, opponent, mean bb, standard error, 95 % interval, total bb |
 | `checkpoints/<run-name>_<iter>.pt` | `state_dict` + iteration + the full training config |
 
 `save_checkpoint` / `load_checkpoint` round-trip the weights exactly; the config
@@ -626,30 +662,33 @@ evaluations are played on.
 
 ### What the tests pin down
 
-`tests/test_training.py` (20 tests) pins the defaults, rejects invalid settings,
-checks the scripted and random opponents, that evaluation returns finite
-statistics with `ci95 == 1.96 × stderr` and a zero-sum-consistent total, that it
-is deterministic for the same weights and seed and restores the network's
-training mode, the checkpoint round-trip and its metadata, the row, evaluation
-and checkpoint counts, CSV contents, evaluation on the final iteration when it
-is off schedule, that training changes the weights, the progress callback order,
-and full-run reproducibility.
+`tests/test_training.py` (33 tests) pins the defaults, rejects invalid settings,
+checks the passive, random, strong-raiser and loose-raiser opponents (including
+the hole-card score and the seeded 35 % raise rate), that evaluation returns
+finite statistics with `ci95 == 1.96 × stderr` and a zero-sum-consistent total,
+that it is deterministic for the same weights and seed and restores the
+network's training mode, the checkpoint round-trip and its metadata, the row,
+evaluation and checkpoint counts, CSV contents per opponent, evaluation on the
+final iteration when it is off schedule, that training changes the weights, the
+progress callback order, the edges of the self-play/opponent mixture, and
+full-run reproducibility.
 
 ---
 
-## Two 50-iteration training runs
+## Three 50-iteration training runs
 
 ```powershell
-python scripts\train_agent_a.py --run-name agent_a      # the original harness
-python scripts\train_agent_a.py --run-name agent_a_v2   # after the value-head fix
-python scripts\plot_training.py --run-name agent_a_v2   # -> runs\agent_a_v2_curve.png
+python scripts\train_agent_a.py --run-name agent_a      # run 1, original harness
+python scripts\train_agent_a.py --run-name agent_a_v2   # run 2, value-loss scale fixed
+python scripts\train_agent_a.py --run-name agent_a_v3   # run 3, mixed training + three opponents
+python scripts\plot_training.py --run-name agent_a_v3 --output docs\agent_a_v3_curve.png
 ```
 
-Both runs use seed 0, 320 self-play hands per iteration, and a 2,000-hand
-evaluation against the same scripted opponent every 10 iterations. The second
-run changed only how the critic's loss is scaled and logged, and adds an
-iteration-0 measurement (which does not affect training); the network, the
-opponent and every hyper-parameter are identical, so the two are comparable.
+Runs 1 and 2 use seed 0, 320 self-play hands per iteration, and a 2,000-hand
+evaluation against the passive opponent every 10 iterations. Run 3 uses seed 0,
+**160 self-play hands plus 160 against `raiser_strong`** per iteration, and
+evaluates 2,000 hands against each of three opponents. Its passive column is
+therefore directly comparable to runs 1 and 2; the two raiser columns are new.
 
 ### Run 1: the original harness
 
@@ -721,6 +760,61 @@ permanent operating point.
 Decisions per hand rose from **3.0 to 10.1** in run 1: the agent stopped folding
 and started playing hands to the end. Against an opponent that never folds, that
 is the correct direction. Run 2 reproduces the same behaviour.
+
+### Run 3: mixed training and a held-out opponent
+
+Run 3 changed the opponent, not the network or the PPO settings. Half of every
+rollout is self-play; half is the learner playing player 0 against
+`raiser_strong`. Evaluation adds the two raiser columns, and `raiser_loose` is
+never trained on.
+
+| Iteration | passive | raiser_strong (train) | raiser_loose (held out) |
+|---|---|---|---|
+| 0 | −0.1050 ±0.1411 | −0.7768 ±0.2321 | −0.7935 ±0.2831 |
+| 10 | −0.0255 ±0.0429 | −0.3495 ±0.1174 | −0.0460 ±0.1452 |
+| 20 | −0.0245 ±0.0431 | −0.3440 ±0.1183 | −0.0480 ±0.1457 |
+| 30 | −0.0175 ±0.0462 | −0.3465 ±0.1204 | +0.0350 ±0.1480 |
+| 40 | +0.1055 ±0.0895 | −0.2170 ±0.1505 | +0.0645 ±0.1836 |
+| 50 | **+0.2005** ±0.1283 | **−0.0940** ±0.1743 | **+0.1875** ±0.2174 |
+
+![Agent A's third run: mixed training, three evaluation opponents](docs/agent_a_v3_curve.png)
+
+Every number is bb/hand against that opponent, with its own 95 % interval.
+
+The change over the run, with a conservative *unpaired* interval formed from the
+two end points:
+
+```text
+passive        -0.1050 -> +0.2005   +0.3055   (+/- 0.19 unpaired)
+raiser_strong  -0.7768 -> -0.0940   +0.6828   (+/- 0.29 unpaired)
+raiser_loose   -0.7935 -> +0.1875   +0.9810   (+/- 0.36 unpaired)
+```
+
+Pairing the same deals would tighten all three; the unpaired form is enough to
+exclude zero in each case.
+
+**The held-out column rose at least as much as the training opponent.** That is
+the result the new design was built to test: the learner did not merely learn the
+bot it was trained on. Against a style it had never seen — raising 35 % of the
+time regardless of cards — it moved from `-0.79` to `+0.19` bb/hand.
+
+Two cautions about reading the absolute values:
+
+* **`raiser_strong` being the only negative column at iteration 50 is not
+  evidence of overfitting.** A bot that raises only strong hands is intrinsically
+  the hardest of the three to face: its raises carry information, so calling them
+  is expensive. Comparing absolute bb/hand *across* opponents compares opponent
+  strength, not the learner's skill. The comparison that means something is each
+  column's change from iteration 0.
+* **The learner saw only 8,000 hands against `raiser_strong`** (160 per iteration
+  × 50), and this is still one seed. The transfer signal is real but noisier than
+  a multi-seed result would be.
+
+The critic stayed at its information ceiling: `EV` moved from `-0.13` to `+0.00`
+(peak `+0.09`), exactly the `3–5 %` band measured below. Entropy fell from `1.096`
+to `0.439`, and the trust region held (`approx KL` max `0.0087`, clip fraction
+max `0.086`) even though the gradient norm exceeded `0.5` on 22 of 50
+iterations. There were 99,626 decisions in total, about 2,000 per iteration.
 
 ### What did not
 
@@ -874,10 +968,12 @@ gradient norm was the critic's loss scale.
 
 ### The caveat that limits the result
 
-The evaluation opponent calls or checks and never folds or raises. Beating it
-means "loses less to a passive caller", not "plays well". The observed gain is
-consistent with learning not to fold, which is a degenerate best response. A
-raising opponent is needed before any play-quality claim.
+Runs 1 and 2 measured only a passive caller, so beating it meant "loses less to
+a caller", not "plays well". Run 3 fixes the opponent-design half of that: two
+raising opponents, one of them held out by style. What remains is scale — one
+seed, 8,000 hands against the training opponent, and no committed paired-difference
+script for the new columns. Those are sample-size limits, not opponent-design
+limits.
 
 ---
 
@@ -1028,19 +1124,22 @@ otherwise recover at the first decision of a hand.
 
 ## Current limitations
 
-* Two 50-iteration runs exist and are reported above, but each is one seed
-  against one passive opponent. Run 2 improved `-0.105` → `+0.277` bb/hand, a
-  paired `+0.382 ± 0.150`; the last four evaluations are not resolved from each
-  other.
+* Three 50-iteration runs exist and are reported above. Runs 1 and 2 are one
+  seed against one passive opponent; run 3 is one seed with 8,000 hands against
+  its training opponent. There is no multi-seed estimate of the run-to-run
+  spread.
 * The value target has an **information ceiling of about 3–5 %** of its variance:
   the payoff's sign depends on hole cards nobody can see. A perfect critic
   therefore removes only a few percent of the advantage noise, so this is not a
   bottleneck that can be fixed — variance has to be bought with hands per
   update.
-* The evaluation opponent calls or checks, so it never folds a bet and never
-  raises. It measures "does the agent beat a passive caller", not "is the agent
-  strong". The observed gain is consistent with learning not to fold, and it is
-  the most likely reason the curve flattens.
+* **The scripted raisers are crude, not competent.** `raiser_strong` scores two
+  hole cards and ignores position, board texture and pot odds; `raiser_loose`
+  ignores cards entirely. Run 3 shows transfer between two scripted styles. It
+  does not show competent heads-up play.
+* Run 3 quotes conservative unpaired intervals for its changes because there is
+  no committed paired-difference script yet. Pairing the same deals would
+  tighten them, as it did for runs 1 and 2.
 * Run 1's log has no iteration-0 row, so its starting point is reconstructed
   rather than logged. Run 2 measures and checkpoints iteration 0.
 * The encoder, the policy/value network, the rollout buffer, the PPO update and
@@ -1062,15 +1161,15 @@ otherwise recover at the first decision of a hand.
 | Stage | Work | Status |
 |---|---|---|
 | 1 | Verify simulator; document observations, actions, payoffs and history; encode Agent B's tokens | ✅ done |
-| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **in progress — trains and improves against one passive opponent** |
+| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **in progress — mixes self-play with a strong raiser; improves against a passive caller, that raiser, and a held-out style** |
 | 3 | Agent B: MLP + GRU over betting history, trained with PPO | planned |
 | 4 | Head-to-head evaluation, ablations and results write-up | planned |
 
-**Recommended next milestone: make the opponent worth beating, and measure how
-much a hand is worth.** The value head turned out to be at its information
-ceiling, so it is not the bottleneck. Two things are: the evaluation opponent
-never folds or raises, so the best available response is degenerate, and a
-`320`-hand rollout gives PPO only ~2,400 gradient steps over the whole run.
+**Recommended next milestone: buy down the noise and check the transfer across
+seeds.** The opponent-design question is answered for one run: a held-out style
+improved alongside the training opponent. The remaining question is whether that
+survives the run-to-run spread. The value head is at its information ceiling, so
+it is not the bottleneck; samples per update and seeds are.
 
 A sensible remaining Stage 2 scope:
 
@@ -1091,10 +1190,12 @@ A sensible remaining Stage 2 scope:
    plain supervised regression.~~ ✅ Answer: the ceiling is `3–5 %` of the return
    variance and a card-embedding network reaches the same place as ridge, so the
    features and the architecture are not the limit.
-10. Add a second scripted opponent that raises, and evaluate against both. Until
-    then every number measures "beats a caller", which is not a poker claim.
-11. Raise `hands_per_iteration` from `320` and watch whether `explained variance`
-    holds at the ceiling while the evaluation interval shrinks. The advantage
-    noise is irreducible, so samples per update are the only lever on it.
-12. Only after that, add the GRU history encoder for Agent B and compare the two
+10. ~~Add a second scripted opponent that raises, and evaluate against both.~~
+    ✅ Run 3 adds `raiser_strong` as the training opponent and `raiser_loose` as
+    a held-out style. Both the training and held-out columns improved.
+11. Add a committed paired-difference evaluator, so run 3's changes can be
+    quoted with the same tighter interval already used for runs 1 and 2.
+12. Repeat run 3 across at least three seeds and raise `hands_per_iteration`;
+    the question is whether the held-out gain survives the run-to-run spread.
+13. Only after that, add the GRU history encoder for Agent B and compare the two
     under the same evaluation protocol.

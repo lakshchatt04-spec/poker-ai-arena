@@ -1,15 +1,30 @@
-"""Train Agent A and evaluate it against a fixed scripted opponent.
+"""Train Agent A and evaluate it against a panel of fixed scripted opponents.
 
 Run from the project root::
 
     python scripts\\train_agent_a.py
 
+Each iteration's rollout is a mixture: ``--self-play-fraction`` of the hands are
+the network playing both seats against itself, and the rest are the network
+playing player 0 against ``--training-opponent``.  Training against one opponent
+alone risks learning that opponent instead of poker, so evaluation keeps more
+than one.
+
 Every ``--eval-every`` iterations (and on the final iteration) the current
-network plays ``--eval-hands`` hands against a scripted call/check opponent,
-using the same deals and the same seed every time.  A per-hand payoff is noisy,
-so the evaluation column is a mean with a 95 % interval, never a bare number.
-Iteration 0 is evaluated too, so the starting point is measured rather than
-reconstructed.
+network plays ``--eval-hands`` hands against each opponent in
+``--eval-opponents``, using the same deals and the same seeds every time.  A
+per-hand payoff is noisy, so each evaluation column is a mean with a 95 %
+interval, never a bare number.  Iteration 0 is evaluated too, so the starting
+point is measured rather than reconstructed.
+
+The three default evaluation opponents answer different questions:
+
+* ``passive`` - calls and checks.  The continuity ruler: earlier runs were
+  measured against it.
+* ``raiser_strong`` - raises only strong hole cards.  The exploitation
+  reference, and by default the *training* opponent.
+* ``raiser_loose`` - raises a fixed 35 % of the time regardless of cards.  Never
+  trained on: a rise here is evidence of generalisation, not of pattern matching.
 
 ``value`` is the mean squared value error divided by the rollout's return
 variance, so ``0`` is a perfect critic and ``1`` predicts the mean.  ``EV`` is
@@ -32,7 +47,12 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from poker_arena.ppo import PPOConfig
-from poker_arena.training import TrainingConfig, train
+from poker_arena.training import (
+    OPPONENT_NAMES,
+    EvaluationRecord,
+    TrainingConfig,
+    train,
+)
 
 
 def _positive_int(value: str) -> int:
@@ -40,6 +60,35 @@ def _positive_int(value: str) -> int:
     if number < 1:
         raise argparse.ArgumentTypeError(f"must be positive, got {number}")
     return number
+
+
+def _fraction(value: str) -> float:
+    number = float(value)
+    if not 0.0 <= number <= 1.0:
+        raise argparse.ArgumentTypeError(
+            f"must be between 0 and 1, got {number}"
+        )
+    return number
+
+
+def _opponent(value: str) -> str:
+    if value not in OPPONENT_NAMES:
+        raise argparse.ArgumentTypeError(
+            f"unknown opponent {value!r}; choose from {', '.join(OPPONENT_NAMES)}"
+        )
+    return value
+
+
+def _opponent_list(value: str) -> tuple[str, ...]:
+    names = tuple(part.strip() for part in value.split(",") if part.strip())
+    if not names:
+        raise argparse.ArgumentTypeError("expected at least one opponent name")
+    unknown = [name for name in names if name not in OPPONENT_NAMES]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown opponents {unknown}; choose from {', '.join(OPPONENT_NAMES)}"
+        )
+    return names
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -50,7 +99,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--hands", type=_positive_int, default=320,
-        help="self-play hands per iteration (default: 320)",
+        help="hands per iteration, split by --self-play-fraction (default: 320)",
+    )
+    parser.add_argument(
+        "--self-play-fraction", type=_fraction, default=0.5,
+        help="fraction of each rollout played as self-play (default: 0.5)",
+    )
+    parser.add_argument(
+        "--training-opponent", type=_opponent, default="raiser_strong",
+        help="scripted opponent for the non-self-play hands "
+             "(default: raiser_strong)",
+    )
+    parser.add_argument(
+        "--eval-opponents", type=_opponent_list,
+        default=("passive", "raiser_strong", "raiser_loose"),
+        help="comma-separated opponents to evaluate "
+             "(default: passive,raiser_strong,raiser_loose)",
     )
     parser.add_argument(
         "--eval-every", type=_positive_int, default=10,
@@ -58,7 +122,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--eval-hands", type=_positive_int, default=2_000,
-        help="hands per evaluation (default: 2000)",
+        help="hands per evaluation, per opponent (default: 2000)",
     )
     parser.add_argument(
         "--seed", type=int, default=0,
@@ -91,6 +155,9 @@ def _config_from(args: argparse.Namespace) -> TrainingConfig:
     return TrainingConfig(
         iterations=args.iterations,
         hands_per_iteration=args.hands,
+        self_play_fraction=args.self_play_fraction,
+        training_opponent=args.training_opponent,
+        evaluation_opponents=args.eval_opponents,
         evaluation_every=args.eval_every,
         evaluation_hands=args.eval_hands,
         seed=args.seed,
@@ -124,7 +191,22 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"iterations {config.iterations}  hands/iter {config.hands_per_iteration}"
         f"  evaluate every {config.evaluation_every} on"
-        f" {config.evaluation_hands} hands"
+        f" {config.evaluation_hands} hands per opponent"
+    )
+    self_play_hands = int(round(
+        config.hands_per_iteration * config.self_play_fraction
+    ))
+    print(
+        f"mix      {self_play_hands} self-play"
+        f" + {config.hands_per_iteration - self_play_hands}"
+        f" vs {config.training_opponent!r}"
+    )
+    print(
+        "eval     "
+        + ", ".join(
+            f"{name} ({'training' if name == config.training_opponent else 'held out'})"
+            for name in config.evaluation_opponents
+        )
     )
     print(
         f"seed {config.seed}  eval seed {config.evaluation_seed}"
@@ -142,13 +224,13 @@ def main(argv: list[str] | None = None) -> int:
         f"{'entropy':>9}{'KL':>8}{'clip':>7}{'grad':>7}"
     )
 
-    def progress(row, record) -> None:
+    def progress(row, records) -> None:
         print(_format_row(row), flush=True)
-        if record is not None:
+        for record in records or ():
             result = record.result
             print(
-                f"      eval @ {record.iteration:>4}: "
-                f"{result.mean_bb:+.4f} bb/hand "
+                f"      eval @ {record.iteration:>4} vs {result.opponent:<14}"
+                f" {result.mean_bb:+.4f} bb/hand "
                 f"+/- {result.ci95_bb:.4f} (95%)  "
                 f"total {result.total_bb:+.1f} bb over {result.hands} hands",
                 flush=True,
@@ -164,25 +246,30 @@ def main(argv: list[str] | None = None) -> int:
         print(f"                 {path}")
 
     if result.evaluations:
-        first = result.evaluations[0].result
-        last = result.evaluations[-1].result
         print()
         print("evaluation summary (bb/hand, 95% interval)")
+        by_opponent: dict[str, list[EvaluationRecord]] = {}
+        for record in result.evaluations:
+            by_opponent.setdefault(record.result.opponent, []).append(record)
+
+        for name in config.evaluation_opponents:
+            records = by_opponent.get(name, [])
+            if not records:
+                continue
+            first = records[0]
+            last = records[-1]
+            intervals = [record.result.ci95_bb for record in records]
+            print(
+                f"  {name:<14} first @ {first.iteration:>4}: "
+                f"{first.result.mean_bb:+.4f} +/- {first.result.ci95_bb:.4f}"
+                f"   last @ {last.iteration:>4}: "
+                f"{last.result.mean_bb:+.4f} +/- {last.result.ci95_bb:.4f}"
+                f"   change {last.result.mean_bb - first.result.mean_bb:+.4f}"
+                f"   typical +/- {sum(intervals) / len(intervals):.4f}"
+            )
         print(
-            f"  first @ {result.evaluations[0].iteration:>4}: "
-            f"{first.mean_bb:+.4f} +/- {first.ci95_bb:.4f}"
-        )
-        print(
-            f"  last  @ {result.evaluations[-1].iteration:>4}: "
-            f"{last.mean_bb:+.4f} +/- {last.ci95_bb:.4f}"
-        )
-        print(
-            f"  change          : {last.mean_bb - first.mean_bb:+.4f} bb/hand"
-        )
-        intervals = [record.result.ci95_bb for record in result.evaluations]
-        print(
-            f"  typical interval: +/- {sum(intervals) / len(intervals):.4f}; "
-            "a change smaller than this is not resolved by the sample"
+            "  a change smaller than its typical interval is not resolved "
+            "by this sample"
         )
     else:
         print()

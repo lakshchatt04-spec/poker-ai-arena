@@ -8,9 +8,11 @@ Reads ``runs/<run-name>_train.csv`` and ``runs/<run-name>_eval.csv`` and writes
 ``runs/<run-name>_curve.png``.
 
 The layout is deliberate: the evaluation panel answers "is it getting better?",
-the explained-variance/entropy panel answers "is it still learning?", and the two diagnostics
-panels answer "is the update still under control?". A single loss curve would
-mix all three questions into one unreadable line.
+with one series per scripted opponent so a held-out opponent is visible next to
+the training one; the explained-variance/entropy panel answers "is it still
+learning?"; and the two diagnostics panels answer "is the update still under
+control?". A single loss curve would mix all three questions into one unreadable
+line.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ TRAIN_COLUMNS = (
 
 #: Written by training runs from the value-head diagnosis onwards.  Older logs
 #: do not have it, so the panel falls back to the raw value loss.
-OPTIONAL_COLUMNS = ("explained_variance",)
+
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
     if not path.exists():
@@ -98,9 +100,19 @@ def main(argv: list[str] | None = None) -> int:
     clip_fraction = _column(train_rows, "clip_fraction")
     grad_norm = _column(train_rows, "grad_norm")
 
-    eval_iteration = _column(eval_rows, "iteration") if eval_rows else np.array([])
-    eval_mean = _column(eval_rows, "mean_bb") if eval_rows else np.array([])
-    eval_ci = _column(eval_rows, "ci95_bb") if eval_rows else np.array([])
+    eval_iteration = (
+        np.unique(_column(eval_rows, "iteration")) if eval_rows else np.array([])
+    )
+    # One evaluation series per opponent.  Older logs have a single unnamed
+    # series, so fall back to one group when the column is absent.
+    if eval_rows:
+        has_opponent = "opponent" in eval_rows[0]
+        eval_groups: dict[str, list[dict[str, str]]] = {}
+        for row in eval_rows:
+            name = row["opponent"] if has_opponent else "scripted"
+            eval_groups.setdefault(name, []).append(row)
+    else:
+        eval_groups = {}
 
     figure, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
     figure.suptitle(
@@ -115,34 +127,33 @@ def main(argv: list[str] | None = None) -> int:
     # -- evaluation: the only panel that should be read as "progress" ------
     top_left = axes[0, 0]
     mark_evaluations(top_left)
-    if eval_rows:
-        top_left.errorbar(
-            eval_iteration,
-            eval_mean,
-            yerr=eval_ci,
-            fmt="o-",
-            color="tab:blue",
-            capsize=4,
-            linewidth=1.5,
-            markersize=5,
-        )
-        top_left.annotate(
-            f"{eval_mean[-1]:+.3f}",
-            xy=(eval_iteration[-1], eval_mean[-1]),
-            xytext=(6, 6),
-            textcoords="offset points",
-            fontsize=9,
-            color="tab:blue",
-        )
-        best = int(np.argmax(eval_mean))
-        top_left.annotate(
-            f"best {eval_mean[best]:+.3f}",
-            xy=(eval_iteration[best], eval_mean[best]),
-            xytext=(6, -14),
-            textcoords="offset points",
-            fontsize=9,
-            color="tab:green",
-        )
+    if eval_groups:
+        palette = plt.get_cmap("tab10").colors
+        for index, (name, rows) in enumerate(eval_groups.items()):
+            iterations = _column(rows, "iteration")
+            means = _column(rows, "mean_bb")
+            intervals = _column(rows, "ci95_bb")
+            color = palette[index % len(palette)]
+            top_left.errorbar(
+                iterations,
+                means,
+                yerr=intervals,
+                fmt="o-",
+                color=color,
+                capsize=4,
+                linewidth=1.5,
+                markersize=5,
+                label=name,
+            )
+            top_left.annotate(
+                f"{means[-1]:+.3f}",
+                xy=(iterations[-1], means[-1]),
+                xytext=(6, 4),
+                textcoords="offset points",
+                fontsize=9,
+                color=color,
+            )
+        top_left.legend(loc="upper left", frameon=False, fontsize=9)
     else:
         top_left.text(
             0.5, 0.5, "no evaluations in this run",
@@ -150,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
             color="0.4",
         )
     top_left.axhline(0.0, color="black", linewidth=0.9)
-    top_left.set_title("Evaluation vs scripted opponent (95% interval)")
+    top_left.set_title("Evaluation vs scripted opponents (95% interval)")
     top_left.set_ylabel("bb per hand")
 
     # -- the two learning signals ------------------------------------------
@@ -240,22 +251,28 @@ def main(argv: list[str] | None = None) -> int:
     print(f"clip fraction  : max {clip_fraction.max():.3f}")
     print(f"grad norm      : max {grad_norm.max():.3f}, "
           f"over limit on {int((grad_norm > 0.5).sum())} iterations")
-    if eval_rows:
+    if eval_groups:
         print()
-        print(f"{'iter':>6}{'hands':>8}{'mean bb':>10}{'95%':>9}")
-        for record, mean, ci in zip(eval_rows, eval_mean, eval_ci):
+        for name, rows in eval_groups.items():
+            iterations = _column(rows, "iteration")
+            means = _column(rows, "mean_bb")
+            intervals = _column(rows, "ci95_bb")
+            best = int(np.argmax(means))
+            print(f"{name}")
             print(
-                f"{int(float(record['iteration'])):>6}"
-                f"{int(float(record['hands'])):>8}"
-                f"{mean:>+10.4f}{ci:>9.4f}"
+                f"  first        : {means[0]:+.4f} bb/hand "
+                f"@ iteration {int(iterations[0])}"
             )
-        print()
-        print(f"first eval     : {eval_mean[0]:+.4f} bb/hand")
-        print(f"last eval      : {eval_mean[-1]:+.4f} bb/hand")
-        print(f"change         : {eval_mean[-1] - eval_mean[0]:+.4f} bb/hand")
-        print(f"best eval      : {eval_mean.max():+.4f} "
-              f"at iteration {int(eval_iteration[int(np.argmax(eval_mean))])}")
-        print(f"typical 95%    : +/- {eval_ci.mean():.4f} bb/hand")
+            print(
+                f"  last         : {means[-1]:+.4f} bb/hand "
+                f"@ iteration {int(iterations[-1])}"
+            )
+            print(f"  change       : {means[-1] - means[0]:+.4f} bb/hand")
+            print(
+                f"  best         : {means[best]:+.4f} "
+                f"at iteration {int(iterations[best])}"
+            )
+            print(f"  typical 95%  : +/- {intervals.mean():.4f} bb/hand")
 
     print(f"\nplot written to {output.resolve()}")
     print("Training plot complete.")

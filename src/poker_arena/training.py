@@ -1,10 +1,25 @@
 """Training loop and fixed-seed evaluation for Agent A.
 
 One iteration collects a rollout, runs one PPO update, and records the
-diagnostics.  Evaluation is deliberately separate: training reward is a noisy
-number that the policy is actively overfitting to, while evaluation replays the
-same deals against the same scripted opponent every time.  A change in the
-evaluation column is therefore a change in the policy, not in the deal.
+diagnostics.  The rollout is a **mixture**: ``self_play_fraction`` of the hands
+are the network playing both seats against itself, and the rest are the network
+playing player 0 against a scripted opponent.  Self-play keeps the policy honest
+against a moving copy of itself; the opponent supplies raising decisions that
+self-play may never discover.  Both halves feed one update, so the two kinds of
+experience share a value scale.
+
+Evaluation is deliberately separate: training reward is a noisy number that the
+policy is actively overfitting to, while evaluation replays the same deals
+against the same bots every time.  A change in an evaluation column is therefore
+a change in the policy, not in the deal.
+
+More than one opponent is evaluated, and they have different jobs.  The passive
+caller is the **continuity ruler**: every number in the README was measured
+against it, so dropping it would make runs incomparable.  The training opponent
+is the **exploitation reference**: beating it can mean pattern-matching it.  At
+least one further opponent should be a **held-out generalisation ruler**, never
+used for training, so a rising curve there is evidence the skill transferred
+rather than that the bot was solved.
 
 Evaluation plays greedily (argmax over the masked logits).  The sampling policy
 is the thing being trained, but the mode is what a fixed-seed comparison should
@@ -63,23 +78,119 @@ def random_opponent(rng: np.random.Generator) -> Opponent:
     return opponent
 
 
+#: Rank order used to score hole cards, worst to best.
+CARD_RANKS = "23456789TJQKA"
+
+#: A hole-card score at or above this is raised by the ``raiser_strong`` style.
+STRONG_HOLE_SCORE = 0.85
+
+#: Per-decision raise probability of the ``raiser_loose`` style.
+LOOSE_RAISE_PROBABILITY = 0.35
+
+#: Every scripted opponent that training and evaluation can ask for.  ``random``
+#: is the uniform legal-action bot, kept as a baseline.
+OPPONENT_NAMES = ("passive", "raiser_strong", "raiser_loose", "random")
+
+
+def hole_strength(state: Mapping[str, Any]) -> float:
+    """A crude, deterministic score for the cards in ``state["raw_obs"]["hand"]``.
+
+    This is not a poker hand evaluator.  It only separates "two big cards, a
+    pair, or suited" from trash, which is all a scripted opponent needs.  It
+    scores ``0.0`` when the hand is unavailable, so a synthetic state never
+    crashes the bot.
+    """
+
+    raw = state.get("raw_obs") or {}
+    cards = raw.get("hand") or []
+    if len(cards) != 2:
+        return 0.0
+
+    try:
+        ranks = sorted(CARD_RANKS.index(str(card)[1].upper()) for card in cards)
+    except (IndexError, ValueError):
+        return 0.0
+
+    score = (ranks[0] + ranks[1]) / 24.0
+    if ranks[0] == ranks[1]:
+        score += 0.6
+    if str(cards[0])[0].upper() == str(cards[1])[0].upper():
+        score += 0.15
+    return score
+
+
+def raising_opponent(should_raise: Callable[[Mapping[str, Any]], bool]) -> Opponent:
+    """Raise when ``should_raise`` says so, otherwise call, check, then fold."""
+
+    def opponent(state: Mapping[str, Any], player_id: int) -> int:
+        legal = state["legal_actions"]
+        if 1 in legal and should_raise(state):  # raise
+            return 1
+        for action in (0, 3, 2):  # call, check, fold
+            if action in legal:
+                return action
+        return 1
+
+    return opponent
+
+
+def make_opponent(name: str, seed: int = 0) -> Opponent:
+    """Build a scripted opponent by name.
+
+    ``raiser_strong`` and ``raiser_loose`` differ in *style*, not just in
+    aggression: the first raises only hole cards its simple score likes, the
+    second raises a fixed fraction of the time regardless of cards.  Training on
+    one and evaluating on the other is what turns an evaluation into a
+    generalisation test rather than an exploitation test.
+    """
+
+    if name == "passive":
+        return scripted_opponent
+    if name == "raiser_strong":
+        return raising_opponent(lambda state: hole_strength(state) >= STRONG_HOLE_SCORE)
+    if name == "raiser_loose":
+        rng = np.random.default_rng(seed)
+        return raising_opponent(
+            lambda state: bool(rng.random() < LOOSE_RAISE_PROBABILITY)
+        )
+    if name == "random":
+        return random_opponent(np.random.default_rng(seed))
+    raise ValueError(
+        f"unknown opponent {name!r}; choose one of {', '.join(OPPONENT_NAMES)}"
+    )
+
+
 @dataclass(frozen=True)
 class TrainingConfig:
     """How long to train, how often to evaluate, and where to write results."""
 
     #: Rollout/update iterations.
     iterations: int = 50
-    #: Self-play hands per iteration.
+    #: Hands per iteration, split between self-play and the training opponent.
     hands_per_iteration: int = 320
+    #: Fraction of each rollout played as self-play.  Both seats are recorded,
+    #: so self-play hands produce two trajectories; opponent hands produce one.
+    self_play_fraction: float = 0.5
+    #: Scripted opponent for the non-self-play hands.
+    training_opponent: str = "raiser_strong"
+    #: Opponents evaluated and logged every time, in log order.  Keep at least
+    #: one that is never used for training: that column is the generalisation
+    #: measure, and the others are the exploitation references.
+    evaluation_opponents: tuple[str, ...] = (
+        "passive",
+        "raiser_strong",
+        "raiser_loose",
+    )
     #: Evaluate every this many iterations, and once on the last one.
     evaluation_every: int = 10
-    #: Hands per evaluation.  The 95% interval is roughly +/- 0.105 bb at 2,000.
+    #: Hands per evaluation, per opponent.  The 95% interval is roughly
+    #: +/- 0.105 bb at 2,000.
     evaluation_hands: int = 2_000
     #: Controls the network initialisation, the training environment and the
     #: action sampling.
     seed: int = 0
-    #: Separate seed for the evaluation environment, so every evaluation sees
-    #: exactly the same deals.
+    #: Separate seed for the evaluation environment and the scripted opponents,
+    #: so every evaluation sees exactly the same deals and the same bot stream.
     evaluation_seed: int = 10_000
     #: Name used for the CSV files and checkpoint files.
     run_name: str = "agent_a"
@@ -95,6 +206,28 @@ class TrainingConfig:
             raise ValueError(
                 f"hands_per_iteration must be positive, "
                 f"got {self.hands_per_iteration!r}"
+            )
+        if not 0.0 <= float(self.self_play_fraction) <= 1.0:
+            raise ValueError(
+                "self_play_fraction must be between 0 and 1, "
+                f"got {self.self_play_fraction!r}"
+            )
+        if self.training_opponent not in OPPONENT_NAMES:
+            raise ValueError(
+                f"unknown training_opponent {self.training_opponent!r}; "
+                f"choose one of {', '.join(OPPONENT_NAMES)}"
+            )
+        if not self.evaluation_opponents:
+            raise ValueError("evaluation_opponents must not be empty")
+        unknown = [
+            name
+            for name in self.evaluation_opponents
+            if name not in OPPONENT_NAMES
+        ]
+        if unknown:
+            raise ValueError(
+                f"unknown evaluation opponents {unknown}; "
+                f"choose from {', '.join(OPPONENT_NAMES)}"
             )
         if int(self.evaluation_every) < 1:
             raise ValueError(
@@ -170,7 +303,7 @@ def evaluate(
     *,
     seed: int = 10_000,
     opponent: Opponent = scripted_opponent,
-    opponent_name: str = "scripted",
+    opponent_name: str = "passive",
 ) -> EvaluationResult:
     """Play ``hands`` hands as player 0 and summarise the payoff in big blinds.
 
@@ -263,17 +396,19 @@ def train(
     config: TrainingConfig,
     *,
     net: PolicyValueNet | None = None,
-    progress: Callable[[dict[str, float | int], EvaluationRecord | None], None]
+    progress: Callable[
+        [dict[str, float | int], tuple[EvaluationRecord, ...] | None], None
+    ]
     | None = None,
 ) -> TrainingResult:
     """Run ``config.iterations`` collect-update steps, evaluating periodically.
 
     Args:
-        config: Length, sizes, seeds and output locations.
+        config: Length, sizes, seeds, opponent mix and output locations.
         net: Optional starting network.  ``None`` initialises one under
             ``config.seed``.
         progress: Called after every iteration with the training row and the
-            evaluation just completed, if any.
+            evaluations just completed (one record per opponent), if any.
 
     Returns:
         The recorded rows, evaluations and checkpoint paths.
@@ -306,27 +441,32 @@ def train(
         train_writer.writeheader()
         evaluation_writer.writeheader()
 
-        def record_evaluation(iteration: int) -> EvaluationRecord:
-            """Evaluate, log the row and write a checkpoint."""
+        def record_evaluation(iteration: int) -> tuple[EvaluationRecord, ...]:
+            """Evaluate every configured opponent, log each row, save once."""
 
-            result = evaluate(
-                net,
-                int(config.evaluation_hands),
-                seed=int(config.evaluation_seed),
-            )
-            record = EvaluationRecord(iteration=iteration, result=result)
-            evaluations.append(record)
-            evaluation_writer.writerow(
-                {
-                    "iteration": iteration,
-                    "hands": result.hands,
-                    "opponent": result.opponent,
-                    "mean_bb": result.mean_bb,
-                    "stderr_bb": result.stderr_bb,
-                    "ci95_bb": result.ci95_bb,
-                    "total_bb": result.total_bb,
-                }
-            )
+            completed: list[EvaluationRecord] = []
+            for name in config.evaluation_opponents:
+                result = evaluate(
+                    net,
+                    int(config.evaluation_hands),
+                    seed=int(config.evaluation_seed),
+                    opponent=make_opponent(name, seed=int(config.evaluation_seed)),
+                    opponent_name=name,
+                )
+                record = EvaluationRecord(iteration=iteration, result=result)
+                evaluations.append(record)
+                completed.append(record)
+                evaluation_writer.writerow(
+                    {
+                        "iteration": iteration,
+                        "hands": result.hands,
+                        "opponent": result.opponent,
+                        "mean_bb": result.mean_bb,
+                        "stderr_bb": result.stderr_bb,
+                        "ci95_bb": result.ci95_bb,
+                        "total_bb": result.total_bb,
+                    }
+                )
             eval_handle.flush()
 
             path = save_checkpoint(
@@ -337,7 +477,7 @@ def train(
                 / f"{config.run_name}_{iteration:04d}.pt",
             )
             checkpoints.append(path)
-            return record
+            return tuple(completed)
 
         # Iteration 0 is a real measurement of the starting network.  Without
         # it the first reported change needs a reconstructed network and a
@@ -345,13 +485,40 @@ def train(
         record_evaluation(0)
 
         for iteration in range(1, int(config.iterations) + 1):
-            trajectories = collect_trajectories(
-                env,
-                encoder,
-                net,
-                hands=int(config.hands_per_iteration),
-                rng=rng,
-            )
+            # Mix self-play and the scripted opponent inside one rollout, then
+            # make one update from the combined batch.  Both halves are needed:
+            # self-play keeps the policy honest against itself, the opponent
+            # supplies the raising decisions self-play may never discover.  A
+            # single update also keeps the two experiences on the same value
+            # scale instead of alternating between two objectives.
+            total_hands = int(config.hands_per_iteration)
+            self_play_hands = int(round(total_hands * config.self_play_fraction))
+            opponent_hands = total_hands - self_play_hands
+
+            trajectories = []
+            if self_play_hands:
+                trajectories.extend(
+                    collect_trajectories(
+                        env, encoder, net, hands=self_play_hands, rng=rng
+                    )
+                )
+            if opponent_hands:
+                # A fresh stream each iteration, but derived from the run seed,
+                # so the opponent is stochastic *and* the run is reproducible.
+                opponent = make_opponent(
+                    config.training_opponent,
+                    seed=int(config.seed) + 7919 * iteration,
+                )
+                trajectories.extend(
+                    collect_trajectories(
+                        env,
+                        encoder,
+                        net,
+                        hands=opponent_hands,
+                        rng=rng,
+                        opponent=opponent,
+                    )
+                )
 
             buffer.clear()
             for trajectory in trajectories:
@@ -368,15 +535,15 @@ def train(
             train_writer.writerow(row)
             train_handle.flush()
 
-            record = None
+            records = None
             if (
                 iteration % int(config.evaluation_every) == 0
                 or iteration == int(config.iterations)
             ):
-                record = record_evaluation(iteration)
+                records = record_evaluation(iteration)
 
             if progress is not None:
-                progress(row, record)
+                progress(row, records)
 
     return TrainingResult(
         iterations=tuple(rows),
