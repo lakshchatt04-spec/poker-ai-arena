@@ -15,8 +15,10 @@ from poker_arena.training import (
     Z_95,
     EvaluationRecord,
     EvaluationResult,
+    PairedEvaluationResult,
     TrainingConfig,
     evaluate,
+    evaluate_paired,
     hole_strength,
     load_checkpoint,
     make_opponent,
@@ -224,6 +226,109 @@ def test_evaluate_accepts_a_random_opponent():
 def test_evaluate_rejects_fewer_than_two_hands():
     with pytest.raises(ValueError):
         evaluate(_new_net(), 1)
+
+
+# -- paired evaluation -----------------------------------------------------
+def test_paired_evaluation_of_identical_networks_is_exactly_zero():
+    net = _new_net()
+
+    result = evaluate_paired(net, copy.deepcopy(net), 40, seed=321)
+
+    assert isinstance(result, PairedEvaluationResult)
+    assert result.hands == 40
+    assert result.opponent == "passive"
+    assert result.mean_difference_bb == 0.0
+    assert result.stderr_difference_bb == 0.0
+    assert result.ci95_difference_bb == 0.0
+    assert result.total_difference_bb == 0.0
+    assert result.ties == 40
+    assert result.wins == 0
+    assert result.losses == 0
+    assert result.differences_bb == (0.0,) * 40
+    # Different deals still have spread; it is the *difference* that is zero.
+    assert result.unpaired_stderr_bb > 0.0
+
+
+def test_paired_evaluation_also_replays_a_stochastic_opponent():
+    # raiser_loose draws its raises from its own RNG.  Per-hand construction from
+    # the deal seed makes that stream identical for both networks too, so two
+    # copies of one network must agree on every hand.
+    net = _new_net()
+
+    result = evaluate_paired(
+        net, copy.deepcopy(net), 30, seed=77, opponent_name="raiser_loose"
+    )
+
+    assert result.ties == 30
+    assert result.mean_difference_bb == 0.0
+
+
+def test_paired_evaluation_is_reproducible_and_tighter_than_independent_means():
+    net_a = _new_net(0)
+    net_b = _new_net(1)
+
+    first = evaluate_paired(net_a, net_b, 300, seed=42)
+    second = evaluate_paired(
+        copy.deepcopy(net_a), copy.deepcopy(net_b), 300, seed=42
+    )
+
+    assert first == second
+    assert first.hands == 300
+    assert first.wins + first.losses + first.ties == 300
+    assert first.mean_difference_bb == pytest.approx(
+        first.mean_a_bb - first.mean_b_bb
+    )
+    assert first.ci95_difference_bb == pytest.approx(
+        Z_95 * first.stderr_difference_bb
+    )
+    assert first.total_difference_bb == pytest.approx(
+        first.mean_difference_bb * first.hands
+    )
+    # The networks play similar policies on the same deals, so the deal noise
+    # cancels and the paired interval is tighter than adding two variances.
+    assert first.stderr_difference_bb < first.unpaired_stderr_bb
+
+
+def test_paired_evaluation_restores_both_training_modes():
+    net_a = _new_net(0)
+    net_b = _new_net(1)
+    net_a.train()
+    net_b.eval()
+
+    evaluate_paired(net_a, net_b, 10, seed=5)
+
+    assert net_a.training
+    assert not net_b.training
+
+
+def test_paired_evaluation_accepts_an_explicit_opponent():
+    net = _new_net()
+
+    result = evaluate_paired(
+        net,
+        copy.deepcopy(net),
+        10,
+        seed=1,
+        opponent=scripted_opponent,
+        opponent_name="custom",
+    )
+
+    assert result.opponent == "custom"
+    assert result.ties == 10
+
+
+def test_paired_evaluation_rejects_an_unknown_opponent():
+    net = _new_net()
+
+    with pytest.raises(ValueError):
+        evaluate_paired(net, copy.deepcopy(net), 10, opponent_name="nope")
+
+
+def test_paired_evaluation_rejects_fewer_than_two_hands():
+    net = _new_net()
+
+    with pytest.raises(ValueError):
+        evaluate_paired(net, copy.deepcopy(net), 1)
 
 
 # -- checkpoints -----------------------------------------------------------

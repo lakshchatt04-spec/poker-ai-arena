@@ -15,6 +15,7 @@ from poker_arena.environment import (
     decode_observation,
     make_environment,
     play_random_hand,
+    reset_hand,
     verify_observation_is_legal,
 )
 
@@ -40,6 +41,41 @@ def test_environment_initializes_with_two_players(env):
     assert env.get_player_id() == player_id
     assert state["obs"].shape == (OBSERVATION_SIZE,)
     assert len(state["raw_obs"]["all_chips"]) == env.num_players
+
+
+def test_reset_hand_corrects_stale_raise_counts_without_changing_the_deal(env):
+    # Play one hand that certainly raises, so the next `reset()` has a stale list
+    # to leak.  Always raising when legal guarantees at least one raise.
+    state, player_id = env.reset()
+    while not env.is_over():
+        for action in (1, 3, 0, 2):
+            if action in state["legal_actions"]:
+                break
+        state, player_id = env.step(action)
+    previous = list(env.game.history_raise_nums)
+    assert any(previous)
+
+    # RLCard's raw reset attaches the previous hand's list to the new state.
+    env.seed(99)
+    raw_state, _ = env.reset()
+    assert list(raw_state["raw_obs"]["raise_nums"]) == previous
+
+    # reset_hand keeps the same deal but clears the stale raise counts and the
+    # native obs block that was built from them.
+    env.seed(99)
+    fixed_state, _ = reset_hand(env)
+    assert list(fixed_state["raw_obs"]["hand"]) == list(
+        raw_state["raw_obs"]["hand"]
+    )
+    assert list(fixed_state["raw_obs"]["public_cards"]) == []
+    assert fixed_state["raw_obs"]["raise_nums"] == [0] * NUM_BETTING_ROUNDS
+
+    start = CARD_SLOT_COUNT
+    stop = start + NUM_BETTING_ROUNDS * RAISE_BLOCK_SIZE
+    assert fixed_state["obs"][start:stop].sum() == NUM_BETTING_ROUNDS
+    assert fixed_state["obs"][start:stop].reshape(
+        NUM_BETTING_ROUNDS, RAISE_BLOCK_SIZE
+    )[:, 0].tolist() == [1.0] * NUM_BETTING_ROUNDS
 
 
 def test_complete_hand_terminates_and_returns_zero_sum_payoffs(env):

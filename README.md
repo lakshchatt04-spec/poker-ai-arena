@@ -49,11 +49,12 @@ poker-ai-arena/
 │   ├── test_ppo.py                 # executable PPO-update report
 │   ├── test_rollout.py             # executable rollout / GAE report
 │   ├── plot_training.py            # reads a run's CSVs, writes a PNG
+│   ├── paired_evaluation.py        # compares two checkpoints on identical deals
 │   └── train_agent_a.py            # trains Agent A and evaluates it
 ├── tests/
 │   ├── conftest.py                 # puts src/ on sys.path for pytest
 │   ├── test_encoding.py            # encoder tests
-│   ├── test_environment.py         # Stage 1 contract tests
+│   ├── test_environment.py         # Stage 1 contract tests + reset correction
 │   ├── test_history.py             # history-encoding tests
 │   ├── test_networks.py            # network tests
 │   ├── test_ppo.py                 # PPO-update tests
@@ -127,6 +128,12 @@ python scripts\train_agent_a.py
 # Plot that run's CSV logs to runs\<run-name>_curve.png.
 python scripts\plot_training.py --run-name agent_a_v3
 
+# Compare two checkpoints on exactly the same deals.
+python scripts\paired_evaluation.py `
+  --checkpoint-a checkpoints\agent_a_v3_0050.pt `
+  --checkpoint-b checkpoints\agent_a_v3_0000.pt `
+  --opponent raiser_loose
+
 # Diagnose how much of the value target is predictable at all.
 python scripts\diagnose_value.py
 ```
@@ -159,7 +166,7 @@ smoke test with `All history-encoding checks passed.`, the encoder report with
 `All observation-encoder checks passed.`, the network report with
 `All network checks passed.`, the rollout report with
 `All rollout checks passed.`, the PPO report with `All PPO checks passed.`, and
-the test suite currently reports `145 passed`.
+the test suite currently reports `170 passed`.
 
 `pytest.ini` limits collection to `tests/` because
 `scripts/test_environment.py` and `tests/test_environment.py` share a filename
@@ -639,6 +646,58 @@ small movement between checkpoints should not be read as progress. It rules out
 the training reward as a progress signal too: it is one noisy sample per
 iteration, from a moving opponent and a changing policy.
 
+### Paired evaluation: the same deals for both checkpoints
+
+`evaluate()` compares two means measured on *different* deal streams, so the
+standard error of the change is `sqrt(se_a² + se_b²)`. Most of a hand's payoff
+variance is the deal — the cards, the blinds, the board — not the policy. If both
+checkpoints play the *same* deal, that common variance cancels.
+
+`evaluate_paired(net_a, net_b, hands, ...)` replays hand `h` twice, both times
+after `env.seed(seed + h)`. It returns the per-hand differences (A minus B), the
+mean difference, a 95 % interval computed **from the differences**, and
+`unpaired_stderr_bb` for comparison. A stochastic opponent is rebuilt per play
+from the same per-hand seed, so its draws are paired as well as the deal. Use it
+from the command line with:
+
+```powershell
+python scripts\paired_evaluation.py `
+  --checkpoint-a checkpoints\agent_a_v3_0050.pt `
+  --checkpoint-b checkpoints\agent_a_v3_0000.pt `
+  --opponent raiser_loose
+```
+
+Checkpoint 0 against checkpoint 50 of run 3, 2,000 paired hands per opponent
+(these use the corrected opening observation described below, so the absolute
+means differ slightly from the `evaluate()` table):
+
+| Opponent | mean A | mean B | **A − B** | paired 95 % | unpaired 95 % | pairing gain |
+|---|---:|---:|---:|---:|---:|---:|
+| `passive` | +0.2440 | −0.0455 | **+0.2895** | ±0.1203 | ±0.1919 | 1.6× |
+| `raiser_strong` | +0.0185 | −0.6665 | **+0.6850** | ±0.1894 | ±0.2840 | 1.5× |
+| `raiser_loose` | +0.2430 | −0.7130 | **+0.9560** | ±0.2225 | ±0.3747 | 1.7× |
+
+All three intervals exclude zero. The improvement is therefore resolved on
+identical deals for every opponent, including the held-out style.
+
+### A simulator quirk the paired evaluator exposed
+
+RLCard 1.2.0 builds the opening state of a hand *before* it rebinds
+`game.history_raise_nums` (`games/limitholdem/game.py`, around lines 98–101).
+The returned `raw_obs["raise_nums"]` is therefore the **previous hand's** list,
+and the native `obs[52:72]` raise block is filled from those stale counts. The
+first decision of every hand was being encoded with fictitious raises from the
+hand before it.
+
+`environment.reset_hand(env)` now resets the environment, replaces the stale list
+with zeros on every street, and rewrites the native raise block to its intended
+fresh value. The deal is already fixed by `reset()`, so this changes only the
+observation. Training, `evaluate()`, `evaluate_paired()` and
+`play_random_hand()` all go through it. Measured on checkpoint 50, 500 hands per
+opponent, the correction moves the absolute mean by `≤ 0.01` bb/hand and changes
+the first-decision action in 1–4 % of hands — far below the evaluation interval,
+but it removes a real previous-hand leak.
+
 ### Outputs
 
 | File | Contents |
@@ -662,7 +721,7 @@ evaluations are played on.
 
 ### What the tests pin down
 
-`tests/test_training.py` (33 tests) pins the defaults, rejects invalid settings,
+`tests/test_training.py` (40 tests) pins the defaults, rejects invalid settings,
 checks the passive, random, strong-raiser and loose-raiser opponents (including
 the hole-card score and the seeded 35 % raise rate), that evaluation returns
 finite statistics with `ci95 == 1.96 × stderr` and a zero-sum-consistent total,
@@ -671,7 +730,10 @@ network's training mode, the checkpoint round-trip and its metadata, the row,
 evaluation and checkpoint counts, CSV contents per opponent, evaluation on the
 final iteration when it is off schedule, that training changes the weights, the
 progress callback order, the edges of the self-play/opponent mixture, and
-full-run reproducibility.
+full-run reproducibility. For paired evaluation it pins exact zero on identical
+networks, seeded reproducibility, the algebraic identities on the difference,
+the tighter-than-unpaired interval, restoration of both training modes, and the
+per-hand replay of a stochastic opponent's draws.
 
 ---
 
@@ -790,8 +852,9 @@ raiser_strong  -0.7768 -> -0.0940   +0.6828   (+/- 0.29 unpaired)
 raiser_loose   -0.7935 -> +0.1875   +0.9810   (+/- 0.36 unpaired)
 ```
 
-Pairing the same deals would tighten all three; the unpaired form is enough to
-exclude zero in each case.
+Pairing the same deals tightens all three and is now committed; see the paired
+evaluation table above. Run 3 itself predates the opening-observation correction
+described there, so the new seed-0 rerun (`agent_a_seed0`) is the clean baseline.
 
 **The held-out column rose at least as much as the training opponent.** That is
 the result the new design was built to test: the learner did not merely learn the
@@ -1113,7 +1176,13 @@ otherwise recover at the first decision of a hand.
    `history_raise_nums`. It keeps changing after the decision, so copy it
    (`list(...)`) before storing it. `HistoryTracker` reads it immediately, so
    tokens always carry the count that was true at decision time.
-8. **`raw_obs` holds card *strings*; `obs` holds slot *numbers*.**
+8. **The opening state of a hand carries the previous hand's raise counts.**
+   RLCard builds the first state before it rebinds `history_raise_nums`, so both
+   `raw_obs["raise_nums"]` and the native `obs[52:72]` block are stale at the
+   first decision. Use `reset_hand(env)` instead of `env.reset()` anywhere the
+   opening state is encoded: it zeroes the list and rewrites the block without
+   changing the deal. All training and evaluation paths use it.
+9. **`raw_obs` holds card *strings*; `obs` holds slot *numbers*.**
    `raw_obs["hand"]` is `['SQ', 'C7']` while `obs[0:52]` is a 52-slot array, and
    `env.card2index` is the only mapping between them. Code that assumes
    `raw_obs` already contains slot indices fails with
@@ -1193,9 +1262,12 @@ A sensible remaining Stage 2 scope:
 10. ~~Add a second scripted opponent that raises, and evaluate against both.~~
     ✅ Run 3 adds `raiser_strong` as the training opponent and `raiser_loose` as
     a held-out style. Both the training and held-out columns improved.
-11. Add a committed paired-difference evaluator, so run 3's changes can be
-    quoted with the same tighter interval already used for runs 1 and 2.
-12. Repeat run 3 across at least three seeds and raise `hands_per_iteration`;
-    the question is whether the held-out gain survives the run-to-run spread.
+11. ~~Add a committed paired-difference evaluator, so run 3's changes can be
+    quoted with the same tighter interval already used for runs 1 and 2.~~ ✅
+    `evaluate_paired` and `scripts/paired_evaluation.py` replay each deal for
+    both checkpoints. All three run-3 changes are resolved on identical deals.
+12. Repeat the run across three seeds and raise `hands_per_iteration`; the
+    question is whether the held-out gain survives the run-to-run spread. Runs
+    `agent_a_seed0..2` and `agent_a_data4x` implement this pass.
 13. Only after that, add the GRU history encoder for Agent B and compare the two
     under the same evaluation protocol.

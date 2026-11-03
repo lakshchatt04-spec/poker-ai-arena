@@ -39,7 +39,7 @@ import torch
 from torch.distributions import Categorical
 
 from .encoding import FEATURE_DIM, ObservationEncoder, small_blind_player
-from .environment import ACTION_NAMES
+from .environment import ACTION_NAMES, reset_hand
 from .networks import PolicyValueNet
 
 NUM_ACTIONS = len(ACTION_NAMES)
@@ -356,7 +356,7 @@ def collect_trajectories(
         for _ in range(int(hands)):
             decisions: dict[int, list[Transition]] = {player: [] for player in recorded}
 
-            state, player_id = env.reset()
+            state, player_id = reset_hand(env)
             small_blind = small_blind_player(state)
 
             while not env.is_over():

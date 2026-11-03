@@ -108,6 +108,43 @@ def make_environment(seed: int = 42, allow_step_back: bool = False) -> Any:
     return env
 
 
+def reset_hand(env: Any) -> tuple[dict[str, Any], int]:
+    """Reset ``env`` and return a first state that belongs to the new hand.
+
+    RLCard 1.2.0 builds the opening state *before* it rebinds
+    ``game.history_raise_nums`` (``games/limitholdem/game.py``: the state is
+    created around line 98, the fresh list is assigned around line 101).  The
+    returned ``raw_obs["raise_nums"]`` therefore still references the **previous
+    hand's** list, and the native ``obs[52:72]`` raise block is filled from those
+    stale counts.  At the first decision of a new hand the intended value is zero
+    raises on every street.
+
+    This helper replaces the stale list and rewrites the corresponding one-hot
+    block, so the first decision of every hand describes *this* hand.  It touches
+    only the observation: the dealer, the cards and the blind draw are already
+    fixed by ``reset()``.
+
+    Use it anywhere a hand starts and its opening state is about to be encoded.
+    Mid-hand states from ``env.step()`` are unaffected and need no correction.
+    """
+
+    state, player_id = env.reset()
+
+    raw_obs = state.get("raw_obs")
+    if isinstance(raw_obs, dict) and "raise_nums" in raw_obs:
+        raw_obs["raise_nums"] = [0] * NUM_BETTING_ROUNDS
+
+    obs = state.get("obs")
+    if obs is not None and len(obs) >= CARD_SLOT_COUNT + NUM_BETTING_ROUNDS * RAISE_BLOCK_SIZE:
+        start = CARD_SLOT_COUNT
+        stop = start + NUM_BETTING_ROUNDS * RAISE_BLOCK_SIZE
+        obs[start:stop] = 0.0
+        for street in range(NUM_BETTING_ROUNDS):
+            obs[start + street * RAISE_BLOCK_SIZE] = 1.0
+
+    return state, player_id
+
+
 def decode_observation(env: Any, obs: np.ndarray) -> ObservationView:
     """Turn a 72-dimensional observation into readable cards and raise counts.
 
@@ -174,7 +211,7 @@ def play_random_hand(
     if rng is None:
         rng = np.random.default_rng()
 
-    state, player_id = env.reset()
+    state, player_id = reset_hand(env)
     steps: list[StepRecord] = []
 
     while not env.is_over():
