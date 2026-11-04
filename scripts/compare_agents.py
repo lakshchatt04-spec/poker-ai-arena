@@ -113,7 +113,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _load(path: str):
+def load_agent(path: str):
     """Load either checkpoint type and return ``(net, metadata, kind)``."""
 
     checkpoint = Path(path)
@@ -129,7 +129,8 @@ def _load(path: str):
     return net, metadata, "agent_a"
 
 
-def _policy(net, kind: str, encoder, *, use_history: bool = True):
+def make_policy(net, kind: str, encoder, *, use_history: bool = True):
+    """Wrap a loaded network in the policy that plays it greedily."""
     if kind == "agent_b":
         return AgentBPolicy(net, encoder, use_history=use_history)
     return AgentAPolicy(net, encoder)
@@ -150,11 +151,11 @@ def main(argv: list[str] | None = None) -> int:
     env = make_environment(seed=args.seed)
     encoder = ObservationEncoder.from_environment(env)
 
-    net_a, meta_a, kind_a = _load(a_path)
-    net_b, meta_b, kind_b = _load(b_path)
+    net_a, meta_a, kind_a = load_agent(a_path)
+    net_b, meta_b, kind_b = load_agent(b_path)
 
-    policy_a = _policy(net_a, kind_a, encoder)
-    policy_b = _policy(net_b, kind_b, encoder)
+    policy_a = make_policy(net_a, kind_a, encoder)
+    policy_b = make_policy(net_b, kind_b, encoder)
     label_a = a_path
     label_b = b_path
     if args.ablate:

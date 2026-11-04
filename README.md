@@ -13,12 +13,17 @@ Two agents will eventually be trained with PPO and compared:
 **Research question:** *Does recurrent memory of opponent actions improve
 reinforcement-learning performance in heads-up poker?*
 
-**Current stage: Stage 2 in progress.** Stage 1 verified the simulator contract and
-implemented Agent B's betting-history encoding. Agent A now trains with PPO on a
-mixture of self-play and a strong scripted raiser, and is evaluated on three
-fixed opponents: a passive caller, that raiser, and a held-out raiser with a
-different style. Run 3 improved against all three, including the held-out one.
-Agent B's GRU is still unused.
+**Current stage: complete through Stage 4, with a negative answer to the research
+question.** Agent A (feed-forward MLP) is trained, hardened across three seeds and
+frozen; it beats a passive caller and transfers to a held-out raiser style. Agent
+B adds a GRU over the betting history, is trained with an identical protocol and
+compared against a capacity-matched control arm on 2,000 shared deals per cell.
+Training with memory is worth `+0.007` to `+0.020` bb/hand over the control with
+the sign flipping across seeds; Agent B is not measurably better than Agent A; and
+zeroing the channel in a trained network costs under `0.01` bb/hand even though
+the policy reads it on 1–2 % of decisions. The body of the README reports the
+numbers, the four lines of evidence, and why the likely cause is redundancy with
+the 131-feature observation rather than an implementation defect.
 
 Stage 1 exists so later results are not built on guesses about RLCard's
 observations, actions, payoffs or history handling. The history encoding is data
@@ -56,11 +61,14 @@ poker-ai-arena/
 │   ├── plot_training.py            # reads a run's CSVs, writes a PNG
 │   ├── paired_evaluation.py        # compares two checkpoints on identical deals
 │   ├── compare_agents.py           # A/B, control-arm and history-ablation comparison
+│   ├── compare_matrix.py           # the whole seed x opponent matrix, one table
+│   ├── history_reliance.py         # how often removing memory changes the action
 │   ├── train_agent_a.py            # trains Agent A and evaluates it
 │   └── train_agent_b.py            # trains Agent B (or its control arm)
 ├── tests/
 │   ├── conftest.py                 # puts src/ on sys.path for pytest
 │   ├── test_agent_b.py             # history network, rollout, PPO, evaluation
+│   ├── test_compare_matrix.py      # batch comparison driver plumbing
 │   ├── test_encoding.py            # encoder tests
 │   ├── test_environment.py         # Stage 1 contract tests + reset correction
 │   ├── test_history.py             # history-encoding tests
@@ -153,6 +161,9 @@ python scripts\compare_agents.py `
   --b checkpoints\agent_b_control_seed0_0050.pt `
   --opponent raiser_loose
 
+# Run every mode x seed x opponent comparison and write one table.
+python scripts\compare_matrix.py --hands 2000 --out runs\b_matrix.md
+
 # Diagnose how much of the value target is predictable at all.
 python scripts\diagnose_value.py
 ```
@@ -191,7 +202,7 @@ smoke test with `All history-encoding checks passed.`, the encoder report with
 `All network checks passed.`, the rollout report with
 `All rollout checks passed.`, the PPO report with `All PPO checks passed.`, the
 Agent B report with `All Agent B network checks passed.`, and the test suite
-currently reports `198 passed`.
+currently reports `204 passed`.
 
 `pytest.ini` limits collection to `tests/` because
 `scripts/test_environment.py` and `tests/test_environment.py` share a filename
@@ -1302,8 +1313,142 @@ python scripts\compare_agents.py `
 ```
 
 The planned experiment is three seeds of the history arm and three seeds of the
-control arm, paired per seed, plus the within-checkpoint ablation. Results are
-pending; this section will be updated when those runs finish.
+control arm, paired per seed, plus the within-checkpoint ablation.
+`scripts/compare_matrix.py` runs that whole matrix (3 modes x 3 seeds x 3
+opponents) in one process and writes a markdown table.
+
+### Runs
+
+Six runs, 50 iterations of 320 hands each, identical protocol to frozen Agent A:
+
+| Run | passive | raiser_strong (trained) | raiser_loose (held out) |
+|---|---|---|---|
+| B history seed 0 | +0.2060 ±0.1519 | −0.0825 ±0.2096 | +0.1840 ±0.2746 |
+| B history seed 1 | +0.1485 ±0.1770 | −0.1650 ±0.2199 | +0.2060 ±0.2984 |
+| B history seed 2 | +0.2040 ±0.1973 | −0.0570 ±0.2474 | +0.3605 ±0.3285 |
+| **history mean ± sd** | **+0.186 ±0.033** | **−0.102 ±0.057** | **+0.250 ±0.096** |
+| B control seed 0 | +0.1780 ±0.2027 | −0.1030 ±0.2728 | +0.2200 ±0.3411 |
+| B control seed 1 | +0.1360 ±0.2130 | −0.1025 ±0.3065 | +0.3025 ±0.3738 |
+| B control seed 2 | +0.1135 ±0.2122 | −0.2350 ±0.2828 | +0.2230 ±0.3737 |
+| **control mean ± sd** | **+0.143 ±0.033** | **−0.147 ±0.076** | **+0.249 ±0.047** |
+
+These are the training loop's own columns: unpaired, 2,000 hands each, with
+Agent B playing as player 0 every hand. They say both arms learn and that
+neither collapses, but they cannot resolve a memory effect of a few hundredths
+of a big blind per hand. The paired matrix below is the actual test.
+
+### Reliance: how much of the policy changes when memory is removed
+
+Per-hand payoff is a noisy readout. `scripts/history_reliance.py` measures the
+channel directly: record the states the history-on policy visits, then re-run
+*those fixed states* through the same weights twice, once with `use_history=True`
+and once with `False`, and count action changes. Feeding both policies a live
+game instead would stop comparing like with like as soon as they diverge.
+
+| Arm | seed 0 | seed 1 | seed 2 |
+|---|---|---|---|
+| history: decisions changed | 2.35 % | 1.65 % | 1.01 % |
+| control: decisions changed | 0.77 % | 0.46 % | 0.43 % |
+
+The control arm is the baseline: its heads never saw a non-zero GRU output, so
+whatever it does when the channel is switched on is untrained sensitivity. The
+history arm changes its action on roughly **1-2 % of decisions beyond that
+baseline** (mean 1.67 % against 0.56 %), and its mean maximum logit shift is
+larger (`0.27-0.43` against `0.19-0.24`). So the trained networks do read the
+channel -- it is not dead -- but they act on it rarely.
+
+### Paired results: memory does not pay for itself
+
+`scripts/compare_matrix.py`, 2,000 paired deals per cell, three seeds. Positive
+means the first policy out-earned the second. `random` is not a training or
+evaluation opponent; it is included as an out-of-distribution probe. The full
+12-cell output is committed at `docs/agent_b_comparison_matrix.md`.
+
+**B with history minus B without history (the control arm, same initial weights)**
+
+| opponent | seed 0 | seed 1 | seed 2 | mean ± sd | resolved seeds |
+|---|---|---|---|---|---|
+| passive | +0.0845 ±0.1086 | +0.0103 ±0.1124 | −0.0740 ±0.1034 | **+0.007 ±0.079** | 0/3 |
+| raiser_strong (trained) | +0.1020 ±0.1435 | −0.0483 ±0.1793 | −0.0275 ±0.1342 | **+0.009 ±0.081** | 0/3 |
+| raiser_loose (held out) | +0.1105 ±0.1854 | +0.0617 ±0.2032 | −0.1125 ±0.1715 | **+0.020 ±0.117** | 0/3 |
+| random (OOD probe) | −0.2895 ±0.1536 | −0.0177 ±0.1497 | −0.2805 ±0.1462 | **−0.196 ±0.154** | 2/3 (both negative) |
+
+The three protocol columns are flat: the largest mean is `+0.02` bb/hand and
+none of the nine seed-level comparisons resolves. The sign also flips between
+seeds, which is what a null effect looks like.
+
+**Agent A minus Agent B (frozen A against B with history)**
+
+| opponent | seed 0 | seed 1 | seed 2 | mean ± sd | resolved seeds |
+|---|---|---|---|---|---|
+| passive | −0.1505 ±0.1084 | +0.0030 ±0.0854 | +0.0660 ±0.1056 | **−0.027 ±0.111** | 1/3 (A worse) |
+| raiser_strong | −0.0970 ±0.1122 | +0.0015 ±0.0876 | +0.0965 ±0.1155 | **+0.000 ±0.097** | 0/3 |
+| raiser_loose (held out) | −0.1555 ±0.1495 | −0.0675 ±0.1292 | −0.0050 ±0.1537 | **−0.076 ±0.076** | 1/3 (A worse) |
+| random | +0.1675 ±0.1143 | −0.2185 ±0.1184 | −0.2660 ±0.1319 | **−0.106 ±0.238** | 3/3 |
+
+A and B are indistinguishable where the protocol measures. On the held-out
+style all three seeds lean slightly towards B (`−0.076` bb/hand for A), but the
+spread is larger than the mean and only one seed resolves. B is also `1.16x`
+larger, so even that lean cannot be credited to memory.
+
+**Within-checkpoint ablation: history on minus history off, identical weights**
+
+| opponent | seed 0 | seed 1 | seed 2 | mean ± sd |
+|---|---|---|---|---|
+| passive | +0.0050 ±0.0238 | −0.0130 ±0.0159 | −0.0080 ±0.0092 | −0.005 ±0.009 |
+| raiser_strong | +0.0120 ±0.0253 | −0.0250 ±0.0214 | −0.0095 ±0.0154 | −0.008 ±0.019 |
+| raiser_loose | +0.0135 ±0.0452 | +0.0110 ±0.0311 | −0.0060 ±0.0275 | +0.006 ±0.011 |
+| random | +0.0360 ±0.0370 | −0.0145 ±0.0327 | −0.0095 ±0.0339 | +0.004 ±0.028 |
+
+This is the tightest test in the whole experiment: same weights, same deals,
+only one input toggled, and the intervals shrink to `±0.01-0.05` because the two
+policies usually agree. Zeroing the channel moves the payoff by **less than
+`0.01` bb/hand** in expectation. One cell resolves at `−0.025` (seed 1 against
+the training opponent); that is a single outcome out of twelve and its magnitude
+is a quarter of a small blind.
+
+### Verdict
+
+**Memory of the opponent's actions does not pay for itself in this game, at this
+scale.** Four independent lines agree:
+
+1. Training with the channel is worth `+0.007` to `+0.020` bb/hand over the
+   capacity-matched control, with the sign changing across seeds.
+2. Agent B is not better than frozen Agent A on any protocol column.
+3. Removing the channel from a trained network costs under `0.01` bb/hand even
+   though the policy is demonstrably sensitive to it.
+4. The policy changes its action on only 1-2 % of decisions when the channel is
+   removed, so the information is barely acted upon.
+
+The most likely explanation is redundancy, not a bug. The 131-feature observation
+already contains `raise_nums` per street, the chips committed, the pot, the
+street and the position, which is most of what the token stream says; the GRU's
+extra information is the *order* of actions within a street, and limit hold'em
+resolves that order largely through who is to act and what the raise counts
+already imply. The critic's information ceiling reported earlier -- only 3-5 % of
+return variance is predictable from the visible state -- caps how much any extra
+input can help.
+
+One anomaly is worth stating rather than hiding: against a uniform-random
+opponent, the history arm loses `0.20` bb/hand to the control, and two of three
+seeds resolve. Random play was never in the training mix or the evaluation
+protocol, so this is an out-of-distribution probe, and twelve aggregate tests
+give a resolved cell some chance of being a false positive. It is still the only
+place where the two arms differ in a resolved way, and the direction opposes
+memory. Resolving it needs more seeds, not more tuning: if it survives, the
+reading would be that recurrent memory of a *patterned* opponent does not
+transfer to an opponent with no pattern at all.
+
+### What this changes about the project
+
+The architecture question is answered negatively for this game and this size of
+network, which is a result, not a dead end. The remaining follow-ups that would
+move the needle are all about the environment, not the model: train against a
+population of opponents that differ in a *history-dependent* way (for example one
+that check-raises only after being raised twice), because that is the only
+situation in which the token stream carries information the observation cannot.
+Adding capacity or tuning PPO further would just chase deal variance, as the
+Agent A hardening pass already showed.
 
 ---
 
@@ -1352,12 +1497,13 @@ pending; this section will be updated when those runs finish.
 * Runs 1 and 2 are one seed against one passive opponent; run 3 is one seed with
   8,000 hands against its training opponent. The hardening pass adds three seeds
   and a 4× data run, and its spread is reported above. Agent B's three-seed
-  history-vs-control experiment has not finished yet.
+  history-vs-control experiment is complete and reported above.
 * The value target has an **information ceiling of about 3–5 %** of its variance:
   the payoff's sign depends on hole cards nobody can see. A perfect critic
   therefore removes only a few percent of the advantage noise, so this is not a
   bottleneck that can be fixed — variance has to be bought with hands per
-  update.
+  update. The same ceiling bounds how much any extra input, including history,
+  can help.
 * **The scripted raisers are crude, not competent.** `raiser_strong` scores two
   hole cards and ignores position, board texture and pot odds; `raiser_loose`
   ignores cards entirely. Run 3 shows transfer between two scripted styles. It
@@ -1366,12 +1512,23 @@ pending; this section will be updated when those runs finish.
   rather than logged. Run 2 measures and checkpoints iteration 0.
 * The encoder, the policy/value network, the rollout buffer, the PPO update and
   the training loop all exist. Agent B's network, rollout, PPO updater, training
-  loop, checkpointing and paired comparison are implemented and tested; only the
-  experiment itself is outstanding.
+  loop, checkpointing, paired comparison and history-reliance diagnostic are
+  implemented, tested and exercised on six runs.
 * Agent B's comparison is confounded slightly by capacity: B has `+15.9 %` more
   parameters than A. The control arm (same capacity, no history input) removes
   that confound for the "memory vs no memory" question, but the headline A-vs-B
-  number cannot separate memory from the wider heads.
+  number cannot separate memory from the wider heads. The verdict rests on the
+  control arm and the ablation, not on the A-vs-B columns.
+* **The negative result is about this game and this opponent set.** In limit
+  hold'em the observation already implies most of what the action order reveals,
+  and none of the three scripted opponents behaves in a way that depends on the
+  history. Whether memory helps against an opponent whose strategy *is*
+  history-dependent is untested and is the first item in the roadmap.
+* One unexplained cell: the history arm loses about `0.20` bb/hand to the
+  control against a uniform-random opponent (2 of 3 seeds resolved). Random play
+  is an out-of-distribution probe, not part of the protocol, and twelve
+  aggregate tests make one false positive plausible — but it is unresolved and
+  the direction opposes memory.
 
 * The `lambda = 0.95` choice is a starting point, not a measurement: on a
   four-decision hand the terminal shock still reaches the first decision with
@@ -1390,15 +1547,25 @@ pending; this section will be updated when those runs finish.
 |---|---|---|
 | 1 | Verify simulator; document observations, actions, payoffs and history; encode Agent B's tokens | ✅ done |
 | 2 | Agent A: observation encoding + MLP policy trained with PPO | ✅ done and frozen — three seeds positive on a held-out style |
-| 3 | **Agent B: MLP + GRU over betting history, trained with PPO** | **implemented and tested; three-seed history-vs-control runs pending** |
-| 4 | Head-to-head evaluation, ablations and results write-up | in progress — paired A/B and ablation tooling is committed |
+| 3 | Agent B: MLP + GRU over betting history, trained with PPO | ✅ done — three seeds trained, paired against the control arm |
+| 4 | Head-to-head evaluation, ablations and results write-up | ✅ done — paired matrix and verdict above |
 
-**Recommended next milestone: run Agent B's history-vs-control experiment.**
-Agent A is frozen because more data helped but further tuning would only chase
-deal variance. Agent B's implementation is complete, and its control arm holds
-capacity and initialisation fixed, so the remaining work is compute rather than
-design: three seeds of each arm, paired per seed, then the within-checkpoint
-ablation.
+**Verdict: the betting-history channel does not pay for itself.** Memory of the
+opponent's actions is worth `+0.007` to `+0.020` bb/hand over a capacity-matched
+control, with the sign flipping across seeds; Agent B is not measurably better
+than frozen Agent A; and zeroing the channel in a trained network costs under
+`0.01` bb/hand even though the policy reads it on 1-2 % of decisions. The most
+likely cause is redundancy with the 131-feature observation, not an
+implementation defect -- every other possible defect (masking, packing, the
+counterfactual state distribution) was checked and has a committed test.
+
+**Recommended next milestone: make the history matter or stop paying for it.**
+The architecture question is closed for this game at this scale. The only
+follow-up with a plausible positive result is an opponent whose behaviour is
+genuinely *history-dependent* -- for example one that check-raises only after
+being raised twice, so that the token stream carries something the observation
+cannot. That changes the environment, not the network. Re-tuning PPO or adding
+capacity would chase deal variance, as the Agent A hardening pass already showed.
 
 A sensible remaining Stage 2 scope:
 
@@ -1435,8 +1602,17 @@ A sensible remaining Stage 2 scope:
     `scripts/train_agent_b.py` and `tests/test_agent_b.py`. The PPO core is
     shared through `run_ppo_update`, and `use_history=False` is the
     capacity-matched control arm.
-14. Run three seeds of `agent_b_seed0..2` and three of
+14. ~~Run three seeds of `agent_b_seed0..2` and three of
     `agent_b_control_seed0..2`, then compare B-history against B-control per
-    seed with `scripts/compare_agents.py`.
-15. Report the paired A-vs-B result and the within-checkpoint history ablation,
-    with intervals and an explicit verdict about whether memory paid for itself.
+    seed.~~ ✅ Six runs, 50 iterations each, identical protocol. Paired with
+    `scripts/compare_matrix.py` on 2,000 shared deals per cell.
+15. ~~Report the paired A-vs-B result and the within-checkpoint history ablation,
+    with intervals and an explicit verdict about whether memory paid for
+    itself.~~ ✅ Verdict above: it does not. Means of `+0.007` to `+0.020` bb/hand
+    over the control, no seed-level cell resolving on the three protocol
+    columns, and under `0.01` bb/hand lost when a trained network's channel is
+    zeroed.
+16. Only if the history question is reopened: add a scripted opponent whose
+    behaviour depends on the history (e.g. one that check-raises only after
+    being raised twice), so the token stream carries information the 131-feature
+    observation cannot. That is an environment change, not an architecture one.
