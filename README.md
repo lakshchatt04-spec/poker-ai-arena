@@ -37,9 +37,13 @@ poker-ai-arena/
 │       ├── environment.py          # Stage 1 inspection helpers
 │       ├── history.py              # Agent B's betting-history tokens
 │       ├── networks.py             # Agent A's policy/value MLP
-│       ├── ppo.py                  # clipped PPO update
+│       ├── networks_b.py           # Agent A's trunk + a GRU over the history
+│       ├── ppo.py                  # clipped PPO update (shared core)
+│       ├── ppo_b.py                # the same update with history tensors
 │       ├── rollout.py              # rollout buffer + GAE for the PPO update
-│       └── training.py             # training loop + fixed-seed evaluation
+│       ├── rollout_b.py            # history-aware rollout collection
+│       ├── training.py             # training loop + fixed-seed evaluation
+│       └── training_b.py           # Agent B loop + policy-based paired evaluation
 ├── scripts/
 │   ├── diagnose_value.py           # how predictable is the value target?
 │   ├── test_encoding.py            # executable encoder report
@@ -48,11 +52,15 @@ poker-ai-arena/
 │   ├── test_networks.py            # executable network report
 │   ├── test_ppo.py                 # executable PPO-update report
 │   ├── test_rollout.py             # executable rollout / GAE report
+│   ├── test_agent_b.py             # Agent B network / rollout / eval report
 │   ├── plot_training.py            # reads a run's CSVs, writes a PNG
 │   ├── paired_evaluation.py        # compares two checkpoints on identical deals
-│   └── train_agent_a.py            # trains Agent A and evaluates it
+│   ├── compare_agents.py           # A/B, control-arm and history-ablation comparison
+│   ├── train_agent_a.py            # trains Agent A and evaluates it
+│   └── train_agent_b.py            # trains Agent B (or its control arm)
 ├── tests/
 │   ├── conftest.py                 # puts src/ on sys.path for pytest
+│   ├── test_agent_b.py             # history network, rollout, PPO, evaluation
 │   ├── test_encoding.py            # encoder tests
 │   ├── test_environment.py         # Stage 1 contract tests + reset correction
 │   ├── test_history.py             # history-encoding tests
@@ -120,10 +128,15 @@ python scripts\test_encoding.py
 python scripts\test_networks.py
 python scripts\test_rollout.py
 python scripts\test_ppo.py
+python scripts\test_agent_b.py
 python -m pytest -q
 
 # Train Agent A, then evaluate as it goes.
 python scripts\train_agent_a.py
+
+# Train Agent B, and the no-history control arm.
+python scripts\train_agent_b.py
+python scripts\train_agent_b.py --no-history --run-name agent_b_control
 
 # Plot that run's CSV logs to runs\<run-name>_curve.png.
 python scripts\plot_training.py --run-name agent_a_v3
@@ -132,6 +145,12 @@ python scripts\plot_training.py --run-name agent_a_v3
 python scripts\paired_evaluation.py `
   --checkpoint-a checkpoints\agent_a_v3_0050.pt `
   --checkpoint-b checkpoints\agent_a_v3_0000.pt `
+  --opponent raiser_loose
+
+# Compare A, B, the control arm, or B's history ablation on identical deals.
+python scripts\compare_agents.py `
+  --a checkpoints\agent_b_seed0_0050.pt `
+  --b checkpoints\agent_b_control_seed0_0050.pt `
   --opponent raiser_loose
 
 # Diagnose how much of the value target is predictable at all.
@@ -147,7 +166,12 @@ Without activation:
 .\.venv\Scripts\python.exe scripts\test_networks.py
 .\.venv\Scripts\python.exe scripts\test_rollout.py
 .\.venv\Scripts\python.exe scripts\test_ppo.py
+.\.venv\Scripts\python.exe scripts\test_agent_b.py
 .\.venv\Scripts\python.exe -m pytest -q
+
+# Agent B, and the no-history control arm.
+.\.venv\Scripts\python.exe scripts\train_agent_b.py
+.\.venv\Scripts\python.exe scripts\train_agent_b.py --no-history --run-name agent_b_control
 ```
 
 The training script takes flags if the defaults are too slow for a quick check:
@@ -165,8 +189,9 @@ The environment smoke test ends with `All Stage 1 checks passed.`, the history
 smoke test with `All history-encoding checks passed.`, the encoder report with
 `All observation-encoder checks passed.`, the network report with
 `All network checks passed.`, the rollout report with
-`All rollout checks passed.`, the PPO report with `All PPO checks passed.`, and
-the test suite currently reports `170 passed`.
+`All rollout checks passed.`, the PPO report with `All PPO checks passed.`, the
+Agent B report with `All Agent B network checks passed.`, and the test suite
+currently reports `198 passed`.
 
 `pytest.ini` limits collection to `tests/` because
 `scripts/test_environment.py` and `tests/test_environment.py` share a filename
@@ -1040,6 +1065,43 @@ limits.
 
 ---
 
+## Stage 2 hardening: three seeds and a 4× data run
+
+Run 3 asked whether a held-out style improves alongside the training opponent.
+One run cannot answer whether that survives the run-to-run spread, so the
+hardening pass repeats the identical configuration under seeds 0, 1 and 2, and
+adds one run with four times the data (1,280 hands per iteration, seed 0).
+Iteration 50, bb/hand, 2,000 hands per column:
+
+| Run | passive | raiser_strong (trained) | raiser_loose (held out) |
+|---|---|---|---|
+| seed 0 | +0.1920 ±0.1836 | −0.0385 ±0.2137 | +0.2025 ±0.2863 |
+| seed 1 | +0.2095 ±0.1616 | −0.0110 ±0.1972 | +0.1475 ±0.2557 |
+| seed 2 | +0.2490 ±0.1718 | +0.0165 ±0.2034 | +0.2875 ±0.2780 |
+| 320 mean ± sd | +0.217 ±0.029 | −0.011 ±0.028 | +0.213 ±0.070 |
+| 4× data (seed 0) | +0.3400 ±0.1826 | **+0.2405** ±0.2147 | +0.2930 ±0.2701 |
+
+**Every seed ends positive on both held-out columns.** The seed-to-seed spread on
+`raiser_loose` (`sd ≈ 0.07`) is smaller than the mean gain (`≈ +0.21`), so the
+transfer is not one lucky run.
+
+The 4× run is the only one with a clearly resolved training-opponent column
+(`+0.2405` against a `±0.2147` interval), and its held-out column sits about one
+seed standard deviation above the three-seed mean. Four times the data therefore
+helps, but the extra held-out gain is still inside the run-to-run spread. The
+honest reading is "more hands help, and this sample cannot resolve how much";
+more hands would keep paying, but further architecture or hyper-parameter tuning
+would not, because the critic is already at its information ceiling and the
+remaining variance is the deal.
+
+**Decision: freeze Agent A at this configuration.** It starts near a coin flip
+and ends at roughly `+0.21` bb/hand against a style it never trained against,
+with all three seeds positive. The next question is architectural: does memory of
+the opponent's actions add anything that the current observation cannot express?
+That is Agent B.
+
+---
+
 ## Verified simulator contract (RLCard 1.2.0)
 
 These facts were checked by running code, not copied from documentation.
@@ -1151,6 +1213,100 @@ otherwise recover at the first decision of a hand.
 
 ---
 
+## Agent B: a GRU over the betting history
+
+Agent A sees 131 numbers that describe *what is true now*. Nothing in them says
+who bet, in what order, or whether the opponent has check-raised twice this
+street. `history.py` turns every action into a token; Agent B reads that token
+stream with a GRU.
+
+### Architecture
+
+```
+features (B, 131)                    tokens (B, 32, 16), mask (B, 32)
+      |                                       |
+131 -> 256 -> 256 (ReLU)                GRU(16, 64), packed by length
+      |                                       |
+      +---------------- concat ----------------+
+                          |
+              (B, 320) -> 4 logits (masked) / 1 value
+```
+
+* The observation trunk is **identical** to Agent A's, layer for layer. The
+  experiment is "does memory help?", not "does a bigger network help?".
+* The heads grow from 256 to 320 inputs, so B has **116,933 parameters** against
+  A's 100,869 (`+16,064`, `+15.9 %`, `1.16×`). The extra capacity is the memory
+  channel plus four wider head rows. A gain for B is evidence that memory is
+  useful; it is not proof that memory is the *only* cause, because B is also
+  slightly wider.
+* The GRU uses **packed sequences** by per-sample length. A GRU fed a zero
+  padding row still moves its hidden state through its biases, so running over
+  all 32 rows would make the memory depend on how much padding followed. An
+  empty history -- the first decision of a hand -- bypasses the GRU and returns
+  the zero state.
+* The history mask must be a **prefix**. `validate_history` enforces that inside
+  `forward`; a hole in the middle would silently reorder the actions.
+* There is **no extra fusion layer**. Adding one would give B a second
+  full-width block of parameters and turn the comparison into "B is bigger".
+
+### Training protocol
+
+`TrainingConfigB` repeats Agent A's protocol exactly: 50 iterations, 320 hands
+each, 50 % self-play + 50 % against `raiser_strong`, the same PPO settings, the
+same three evaluation opponents at 2,000 hands each, iteration 0 measured and
+checkpointed. The rollout (`rollout_b.py`) stores the token table and mask
+alongside each decision; GAE is imported from `rollout.py`, not reimplemented.
+
+The PPO core is shared. `ppo.run_ppo_update` takes a `forward(index)` callback
+that returns `(logits, values)`; `HistoryPPOUpdater` supplies one that includes
+the history tensors, and Agent A's updater supplies one that does not. Two PPO
+implementations would eventually disagree about something subtle, and then an
+A/B result would no longer be about the architecture.
+
+### The control arm
+
+`HistoryPolicyValueNet` is constructed identically for a given seed whether or
+not history is used, so `--no-history` starts from **exactly the same weights**
+as the history run. With `use_history=False` the GRU output is replaced by zeros,
+which also blocks the gradient to the recurrent weights. The control therefore
+answers "does the memory channel help?" with the same heads, the same
+initialisation and the same capacity.
+
+### Evaluation
+
+`evaluate_paired_policies` compares any two policies -- A vs B, B-history vs
+B-control, or B with history on vs off -- on identical deals. Each hand is
+replayed after `env.seed(seed + hand)` for both policies, and a stochastic
+scripted opponent is rebuilt per play from the same per-hand seed.
+`scripts/compare_agents.py` wraps it and detects the checkpoint type from the
+payload (`history_hidden` marks B). Positive `mean A - B` means A out-earned B
+per hand.
+
+```powershell
+# B-history vs B-control, matching seed.
+python scripts\compare_agents.py `
+  --a checkpoints\agent_b_seed0_0050.pt `
+  --b checkpoints\agent_b_control_seed0_0050.pt `
+  --opponent raiser_loose
+
+# Agent A vs Agent B on identical deals.
+python scripts\compare_agents.py `
+  --a checkpoints\agent_a_seed0_0050.pt `
+  --b checkpoints\agent_b_seed0_0050.pt `
+  --opponent raiser_loose
+
+# Within-checkpoint ablation: identical weights, history on vs off.
+python scripts\compare_agents.py `
+  --b checkpoints\agent_b_seed0_0050.pt `
+  --ablate --opponent raiser_loose
+```
+
+The planned experiment is three seeds of the history arm and three seeds of the
+control arm, paired per seed, plus the within-checkpoint ablation. Results are
+pending; this section will be updated when those runs finish.
+
+---
+
 ## Known pitfalls
 
 1. **`state["action_record"]` is a live list.** It is the same object as
@@ -1193,10 +1349,10 @@ otherwise recover at the first decision of a hand.
 
 ## Current limitations
 
-* Three 50-iteration runs exist and are reported above. Runs 1 and 2 are one
-  seed against one passive opponent; run 3 is one seed with 8,000 hands against
-  its training opponent. There is no multi-seed estimate of the run-to-run
-  spread.
+* Runs 1 and 2 are one seed against one passive opponent; run 3 is one seed with
+  8,000 hands against its training opponent. The hardening pass adds three seeds
+  and a 4× data run, and its spread is reported above. Agent B's three-seed
+  history-vs-control experiment has not finished yet.
 * The value target has an **information ceiling of about 3–5 %** of its variance:
   the payoff's sign depends on hole cards nobody can see. A perfect critic
   therefore removes only a few percent of the advantage noise, so this is not a
@@ -1206,13 +1362,16 @@ otherwise recover at the first decision of a hand.
   hole cards and ignores position, board texture and pot odds; `raiser_loose`
   ignores cards entirely. Run 3 shows transfer between two scripted styles. It
   does not show competent heads-up play.
-* Run 3 quotes conservative unpaired intervals for its changes because there is
-  no committed paired-difference script yet. Pairing the same deals would
-  tighten them, as it did for runs 1 and 2.
 * Run 1's log has no iteration-0 row, so its starting point is reconstructed
   rather than logged. Run 2 measures and checkpoints iteration 0.
 * The encoder, the policy/value network, the rollout buffer, the PPO update and
-  the training loop all exist; Agent B's history tokens are encoded and unused.
+  the training loop all exist. Agent B's network, rollout, PPO updater, training
+  loop, checkpointing and paired comparison are implemented and tested; only the
+  experiment itself is outstanding.
+* Agent B's comparison is confounded slightly by capacity: B has `+15.9 %` more
+  parameters than A. The control arm (same capacity, no history input) removes
+  that confound for the "memory vs no memory" question, but the headline A-vs-B
+  number cannot separate memory from the wider heads.
 
 * The `lambda = 0.95` choice is a starting point, not a measurement: on a
   four-decision hand the terminal shock still reaches the first decision with
@@ -1230,15 +1389,16 @@ otherwise recover at the first decision of a hand.
 | Stage | Work | Status |
 |---|---|---|
 | 1 | Verify simulator; document observations, actions, payoffs and history; encode Agent B's tokens | ✅ done |
-| 2 | **Agent A: observation encoding + MLP policy trained with PPO** | **in progress — mixes self-play with a strong raiser; improves against a passive caller, that raiser, and a held-out style** |
-| 3 | Agent B: MLP + GRU over betting history, trained with PPO | planned |
-| 4 | Head-to-head evaluation, ablations and results write-up | planned |
+| 2 | Agent A: observation encoding + MLP policy trained with PPO | ✅ done and frozen — three seeds positive on a held-out style |
+| 3 | **Agent B: MLP + GRU over betting history, trained with PPO** | **implemented and tested; three-seed history-vs-control runs pending** |
+| 4 | Head-to-head evaluation, ablations and results write-up | in progress — paired A/B and ablation tooling is committed |
 
-**Recommended next milestone: buy down the noise and check the transfer across
-seeds.** The opponent-design question is answered for one run: a held-out style
-improved alongside the training opponent. The remaining question is whether that
-survives the run-to-run spread. The value head is at its information ceiling, so
-it is not the bottleneck; samples per update and seeds are.
+**Recommended next milestone: run Agent B's history-vs-control experiment.**
+Agent A is frozen because more data helped but further tuning would only chase
+deal variance. Agent B's implementation is complete, and its control arm holds
+capacity and initialisation fixed, so the remaining work is compute rather than
+design: three seeds of each arm, paired per seed, then the within-checkpoint
+ablation.
 
 A sensible remaining Stage 2 scope:
 
@@ -1266,8 +1426,17 @@ A sensible remaining Stage 2 scope:
     quoted with the same tighter interval already used for runs 1 and 2.~~ ✅
     `evaluate_paired` and `scripts/paired_evaluation.py` replay each deal for
     both checkpoints. All three run-3 changes are resolved on identical deals.
-12. Repeat the run across three seeds and raise `hands_per_iteration`; the
-    question is whether the held-out gain survives the run-to-run spread. Runs
-    `agent_a_seed0..2` and `agent_a_data4x` implement this pass.
-13. Only after that, add the GRU history encoder for Agent B and compare the two
-    under the same evaluation protocol.
+12. ~~Repeat the run across three seeds and raise `hands_per_iteration`; the
+    question is whether the held-out gain survives the run-to-run spread.~~ ✅
+    Runs `agent_a_seed0..2` and `agent_a_data4x` implement this pass. All three
+    seeds finish positive on the held-out style; Agent A is frozen.
+13. ~~Add the GRU history encoder and Agent B's network, rollout and PPO
+    updater.~~ ✅ `networks_b.py`, `rollout_b.py`, `ppo_b.py`, `training_b.py`,
+    `scripts/train_agent_b.py` and `tests/test_agent_b.py`. The PPO core is
+    shared through `run_ppo_update`, and `use_history=False` is the
+    capacity-matched control arm.
+14. Run three seeds of `agent_b_seed0..2` and three of
+    `agent_b_control_seed0..2`, then compare B-history against B-control per
+    seed with `scripts/compare_agents.py`.
+15. Report the paired A-vs-B result and the within-checkpoint history ablation,
+    with intervals and an explicit verdict about whether memory paid for itself.

@@ -56,11 +56,12 @@ because one bad state can otherwise move all 100k weights.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
 import torch
-from torch import nn
+from torch import Tensor, nn
 from torch.distributions import Categorical
 
 from .encoding import FEATURE_DIM
@@ -172,128 +173,189 @@ class PPOUpdater:
 
         _validate_batch(batch)
 
-        advantages = (
-            normalize_advantages(batch.advantages)
-            if self.config.normalize_advantages
-            else np.asarray(batch.advantages, dtype=np.float32)
-        )
-
-        # Diagnostics about the critic that produced this rollout.  Measured
-        # before any gradient step, so it describes the sampling policy's own
-        # values rather than the ones being fitted right now.
-        sampled_returns = np.asarray(batch.returns, dtype=np.float64)
-        sampled_values = np.asarray(batch.values, dtype=np.float64)
-        return_variance = float(sampled_returns.var())
-        return_std = float(np.sqrt(return_variance))
-        if return_variance > 0.0:
-            explained_variance = 1.0 - float(
-                np.mean((sampled_returns - sampled_values) ** 2)
-            ) / return_variance
-        else:
-            # Every return is identical: there is nothing to explain, and a mean
-            # predictor is already perfect.
-            explained_variance = 0.0
-
-        # A degenerate batch (all returns equal) has nothing to scale by.
-        return_scale = (
-            return_std
-            if self.config.normalize_value_loss and return_std > 1e-8
-            else 1.0
-        )
-
         features = torch.as_tensor(np.ascontiguousarray(batch.features))
         legal_masks = torch.as_tensor(np.ascontiguousarray(batch.legal_masks))
-        actions = torch.as_tensor(batch.actions, dtype=torch.long)
-        old_log_probs = torch.as_tensor(
-            np.ascontiguousarray(batch.log_probs)
+
+        def forward(index: Tensor) -> tuple[Tensor, Tensor]:
+            # Agent A's network reads only the observation and the legal mask.
+            return self.net(features[index], legal_masks[index])
+
+        return run_ppo_update(
+            net=self.net,
+            config=self.config,
+            optimizer=self.optimizer,
+            generator=self._generator,
+            count=int(batch.features.shape[0]),
+            forward=forward,
+            actions=batch.actions,
+            log_probs=batch.log_probs,
+            values=batch.values,
+            advantages=batch.advantages,
+            returns=batch.returns,
         )
-        returns = torch.as_tensor(np.ascontiguousarray(batch.returns))
-        advantages_tensor = torch.as_tensor(np.ascontiguousarray(advantages))
 
-        count = int(batch.features.shape[0])
-        totals = {
-            "policy_loss": 0.0,
-            "value_loss": 0.0,
-            "entropy": 0.0,
-            "total_loss": 0.0,
-            "approx_kl": 0.0,
-            "clip_fraction": 0.0,
-            "grad_norm": 0.0,
-        }
-        visited = 0
-        minibatches = 0
 
-        self.net.train()
+def run_ppo_update(
+    *,
+    net: nn.Module,
+    config: PPOConfig,
+    optimizer: torch.optim.Optimizer,
+    generator: torch.Generator | None,
+    count: int,
+    forward: Callable[[Tensor], tuple[Tensor, Tensor]],
+    actions: np.ndarray,
+    log_probs: np.ndarray,
+    values: np.ndarray,
+    advantages: np.ndarray,
+    returns: np.ndarray,
+) -> dict[str, float | int]:
+    """Run the clipped PPO update over one fixed batch of decisions.
 
-        for _ in range(int(self.config.epochs)):
-            order = torch.randperm(count, generator=self._generator).tolist()
-            for start in range(0, count, int(self.config.minibatch_size)):
-                rows = order[start : start + int(self.config.minibatch_size)]
-                index = torch.as_tensor(rows, dtype=torch.long)
-                weight = len(rows)
+    This is the optimiser core shared by Agent A and Agent B.  It is deliberately
+    network-agnostic: the caller supplies ``forward(index)``, which maps a tensor
+    of row indices to ``(logits, values)``.  Agent A closes over its observation
+    batch; Agent B closes over observations *and* history tensors.  Everything
+    that defines PPO -- the ratio, the clipped surrogate, the entropy bonus, the
+    variance-scaled value loss, the diagnostics and the gradient clip -- lives
+    here once, so an A/B experiment isolates the architecture rather than
+    comparing two subtly different optimisers.
 
-                logits, values = self.net(
-                    features[index], legal_masks[index]
+    Args:
+        net: The module being optimised.  Switched to training mode.
+        config: Hyper-parameters.
+        optimizer: Owns the parameters of ``net``; its moment estimates persist
+            across calls.
+        generator: Optional private generator for minibatch shuffling.
+        count: Number of rows in the batch.
+        forward: Row-index -> ``(logits, values)``.
+        actions: ``(count,)`` sampled action ids.
+        log_probs: ``(count,)`` log-probabilities from the sampling forward pass.
+        values: ``(count,)`` critic estimates from the sampling forward pass.
+        advantages: ``(count,)`` raw advantages; normalised here if configured.
+        returns: ``(count,)`` value targets.
+
+    Returns:
+        Batch-mean diagnostics plus the critic's explained variance and the
+        rollout's return standard deviation.
+    """
+
+    normalised_advantages = (
+        normalize_advantages(advantages)
+        if config.normalize_advantages
+        else np.asarray(advantages, dtype=np.float32)
+    )
+
+    # Diagnostics about the critic that produced this rollout.  Measured
+    # before any gradient step, so it describes the sampling policy's own
+    # values rather than the ones being fitted right now.
+    sampled_returns = np.asarray(returns, dtype=np.float64)
+    sampled_values = np.asarray(values, dtype=np.float64)
+    return_variance = float(sampled_returns.var())
+    return_std = float(np.sqrt(return_variance))
+    if return_variance > 0.0:
+        explained_variance = 1.0 - float(
+            np.mean((sampled_returns - sampled_values) ** 2)
+        ) / return_variance
+    else:
+        # Every return is identical: there is nothing to explain, and a mean
+        # predictor is already perfect.
+        explained_variance = 0.0
+
+    # A degenerate batch (all returns equal) has nothing to scale by.
+    return_scale = (
+        return_std
+        if config.normalize_value_loss and return_std > 1e-8
+        else 1.0
+    )
+
+    actions_tensor = torch.as_tensor(actions, dtype=torch.long)
+    old_log_probs = torch.as_tensor(np.ascontiguousarray(log_probs))
+    returns_tensor = torch.as_tensor(np.ascontiguousarray(returns))
+    advantages_tensor = torch.as_tensor(
+        np.ascontiguousarray(normalised_advantages)
+    )
+
+    totals = {
+        "policy_loss": 0.0,
+        "value_loss": 0.0,
+        "entropy": 0.0,
+        "total_loss": 0.0,
+        "approx_kl": 0.0,
+        "clip_fraction": 0.0,
+        "grad_norm": 0.0,
+    }
+    visited = 0
+    minibatches = 0
+
+    net.train()
+
+    for _ in range(int(config.epochs)):
+        order = torch.randperm(int(count), generator=generator).tolist()
+        for start in range(0, int(count), int(config.minibatch_size)):
+            rows = order[start : start + int(config.minibatch_size)]
+            index = torch.as_tensor(rows, dtype=torch.long)
+            weight = len(rows)
+
+            logits, batch_values = forward(index)
+            distribution = Categorical(logits=logits)
+            new_log_probs = distribution.log_prob(actions_tensor[index])
+            entropy = distribution.entropy().mean()
+
+            # old_log_probs is a stored constant: this subtraction is what
+            # makes the ratio a ratio rather than an identity.
+            ratio = torch.exp(new_log_probs - old_log_probs[index])
+            unclipped = ratio * advantages_tensor[index]
+            clipped = (
+                ratio.clamp(
+                    1.0 - float(config.clip_epsilon),
+                    1.0 + float(config.clip_epsilon),
                 )
-                distribution = Categorical(logits=logits)
-                new_log_probs = distribution.log_prob(actions[index])
-                entropy = distribution.entropy().mean()
+                * advantages_tensor[index]
+            )
+            policy_loss = -torch.min(unclipped, clipped).mean()
+            value_loss = (
+                (batch_values - returns_tensor[index]) / return_scale
+            ).pow(2).mean()
 
-                # old_log_probs is a stored constant: this subtraction is what
-                # makes the ratio a ratio rather than an identity.
-                ratio = torch.exp(new_log_probs - old_log_probs[index])
-                unclipped = ratio * advantages_tensor[index]
-                clipped = (
-                    ratio.clamp(
-                        1.0 - float(self.config.clip_epsilon),
-                        1.0 + float(self.config.clip_epsilon),
-                    )
-                    * advantages_tensor[index]
-                )
-                policy_loss = -torch.min(unclipped, clipped).mean()
-                value_loss = (
-                    (values - returns[index]) / return_scale
-                ).pow(2).mean()
+            loss = (
+                policy_loss
+                - float(config.entropy_coef) * entropy
+                + float(config.value_coef) * value_loss
+            )
 
-                loss = (
-                    policy_loss
-                    - float(self.config.entropy_coef) * entropy
-                    + float(self.config.value_coef) * value_loss
-                )
+            optimizer.zero_grad()
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                net.parameters(), float(config.max_grad_norm)
+            )
+            optimizer.step()
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.net.parameters(), float(self.config.max_grad_norm)
-                )
-                self.optimizer.step()
+            with torch.no_grad():
+                log_ratio = new_log_probs - old_log_probs[index]
+                approx_kl = ((ratio - 1.0) - log_ratio).mean()
+                clip_fraction = (
+                    (ratio - 1.0).abs() > float(config.clip_epsilon)
+                ).float().mean()
 
-                with torch.no_grad():
-                    log_ratio = new_log_probs - old_log_probs[index]
-                    approx_kl = ((ratio - 1.0) - log_ratio).mean()
-                    clip_fraction = (
-                        (ratio - 1.0).abs() > float(self.config.clip_epsilon)
-                    ).float().mean()
+            totals["policy_loss"] += float(policy_loss.detach()) * weight
+            totals["value_loss"] += float(value_loss.detach()) * weight
+            totals["entropy"] += float(entropy.detach()) * weight
+            totals["total_loss"] += float(loss.detach()) * weight
+            totals["approx_kl"] += float(approx_kl) * weight
+            totals["clip_fraction"] += float(clip_fraction) * weight
+            totals["grad_norm"] += float(grad_norm) * weight
+            visited += weight
+            minibatches += 1
 
-                totals["policy_loss"] += float(policy_loss.detach()) * weight
-                totals["value_loss"] += float(value_loss.detach()) * weight
-                totals["entropy"] += float(entropy.detach()) * weight
-                totals["total_loss"] += float(loss.detach()) * weight
-                totals["approx_kl"] += float(approx_kl) * weight
-                totals["clip_fraction"] += float(clip_fraction) * weight
-                totals["grad_norm"] += float(grad_norm) * weight
-                visited += weight
-                minibatches += 1
-
-        stats: dict[str, float | int] = {
-            name: total / visited for name, total in totals.items()
-        }
-        stats["explained_variance"] = explained_variance
-        stats["return_std"] = return_std
-        stats["epochs"] = int(self.config.epochs)
-        stats["minibatches"] = minibatches
-        stats["samples"] = count
-        return stats
+    stats: dict[str, float | int] = {
+        name: total / visited for name, total in totals.items()
+    }
+    stats["explained_variance"] = explained_variance
+    stats["return_std"] = return_std
+    stats["epochs"] = int(config.epochs)
+    stats["minibatches"] = minibatches
+    stats["samples"] = int(count)
+    return stats
 
 
 def _validate_batch(batch: RolloutBatch) -> None:

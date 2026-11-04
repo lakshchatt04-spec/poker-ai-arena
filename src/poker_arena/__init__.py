@@ -1,10 +1,12 @@
 """Poker AI Arena: a heads-up Limit Texas Hold'em research testbed.
 
 Stage 1 exposes simulator-inspection helpers plus the fixed-size betting-history
-encoding Agent B's GRU will read.  Stage 2 adds Agent A's 131-number observation
+encoding Agent B's GRU reads.  Stage 2 adds Agent A's 131-number observation
 encoder, its policy/value network, the rollout buffer that turns played hands into
 GAE advantages, the clipped PPO update, and a training loop with a fixed-seed
-evaluation harness.
+evaluation harness.  Stage 3 adds Agent B: the same trunk with a GRU side channel
+over the action history, its history-aware rollout and PPO updater, and a paired
+evaluator that compares A, B and the no-history ablation on identical deals.
 """
 
 from .encoding import (
@@ -49,7 +51,13 @@ from .networks import (
     MASKED_LOGIT,
     PolicyValueNet,
 )
-from .ppo import PPOConfig, PPOUpdater
+from .networks_b import (
+    HISTORY_HIDDEN,
+    HistoryEncoder,
+    HistoryPolicyValueNet,
+)
+from .ppo import PPOConfig, PPOUpdater, run_ppo_update
+from .ppo_b import HistoryPPOUpdater
 from .rollout import (
     GAE_LAMBDA,
     GAMMA,
@@ -60,6 +68,13 @@ from .rollout import (
     collect_trajectories,
     compute_gae,
     normalize_advantages,
+)
+from .rollout_b import (
+    HistoryRolloutBatch,
+    HistoryRolloutBuffer,
+    HistoryTrajectory,
+    HistoryTransition,
+    collect_history_trajectories,
 )
 from .training import (
     OPPONENT_NAMES,
@@ -80,6 +95,16 @@ from .training import (
     scripted_opponent,
     train,
 )
+from .training_b import (
+    AgentAPolicy,
+    AgentBPolicy,
+    TrainingConfigB,
+    evaluate_paired_policies,
+    evaluate_policy,
+    load_checkpoint_b,
+    save_checkpoint_b,
+    train_b,
+)
 
 __all__ = [
     "ACTION_NAMES",
@@ -89,6 +114,7 @@ __all__ = [
     "GAE_LAMBDA",
     "GAMMA",
     "HIDDEN_WIDTH",
+    "HISTORY_HIDDEN",
     "OPPONENT_NAMES",
     "MASKED_LOGIT",
     "MAX_HISTORY_TOKENS",
@@ -101,12 +127,21 @@ __all__ = [
     "TOKEN_DIM",
     "Z_95",
     "ActionToken",
+    "AgentAPolicy",
+    "AgentBPolicy",
     "EncodedState",
     "EvaluationRecord",
     "EvaluationResult",
     "HandResult",
+    "HistoryEncoder",
+    "HistoryPPOUpdater",
+    "HistoryPolicyValueNet",
+    "HistoryRolloutBatch",
+    "HistoryRolloutBuffer",
     "HistorySequence",
     "HistoryTracker",
+    "HistoryTrajectory",
+    "HistoryTransition",
     "ObservationEncoder",
     "ObservationView",
     "PPOConfig",
@@ -118,17 +153,22 @@ __all__ = [
     "StepRecord",
     "Trajectory",
     "TrainingConfig",
+    "TrainingConfigB",
     "TrainingResult",
     "Transition",
     "action_mask",
+    "collect_history_trajectories",
     "collect_trajectories",
     "compute_gae",
     "decode_observation",
     "encode_token",
     "evaluate",
     "evaluate_paired",
+    "evaluate_paired_policies",
+    "evaluate_policy",
     "hole_strength",
     "load_checkpoint",
+    "load_checkpoint_b",
     "make_environment",
     "make_opponent",
     "normalize",
@@ -137,11 +177,14 @@ __all__ = [
     "raising_opponent",
     "random_opponent",
     "reset_hand",
+    "run_ppo_update",
     "save_checkpoint",
+    "save_checkpoint_b",
     "scripted_opponent",
     "small_blind_player",
     "street_from_board_size",
     "train",
+    "train_b",
     "validate_environment_contract",
     "verify_observation_is_legal",
 ]
