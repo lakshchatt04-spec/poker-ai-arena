@@ -25,7 +25,10 @@ held-out opponent (3/3 seeds each). But the trained policy still barely uses the
 channel: the within-checkpoint ablation is `-0.007` bb/hand and removing it
 changes only 0.4-1.3 % of greedy actions. The evidence points to memory acting
 as a **training-time scaffold**: it lets PPO find the mode-conditional strategy,
-after which the trunk absorbs a features-only proxy for the mode.
+after which the trunk absorbs a features-only proxy for the mode. Breaking that
+proxy at evaluation time does not revive reliance (`+0.0035` bb/hand), so the
+channel is not decision-relevant even when the features cannot reveal the
+agent's own pre-flop action.
 
 That is exactly the failure mode predicted when the opponent was designed.
 Reaching the same chips and raise count in both modes requires the agent to act
@@ -74,6 +77,7 @@ poker-ai-arena/
 │   ├── compare_matrix.py           # the whole seed x opponent matrix, one table
 │   ├── history_reliance.py         # how often removing memory changes the action
 │   ├── history_probe.py            # is the opponent's hidden mode in the observation?
+│   ├── proxy_break.py              # does memory matter once the card proxy is broken?
 │   ├── train_agent_a.py            # trains Agent A and evaluates it
 │   └── train_agent_b.py            # trains Agent B (or its control arm)
 ├── tests/
@@ -1599,6 +1603,42 @@ same information into a features-only representation. The final policy is
 therefore close to memoryless even though the training run that produced it
 benefited from memory.
 
+### Breaking the proxy at evaluation time
+
+If the proxy explanation is right, then removing the proxy should make the
+trained channel matter again. `scripts/proxy_break.py` tests that without
+retraining. It plays paired deals under two conditions:
+
+* `greedy`: the agent plays its trained policy, reproducing the small ablation.
+* `forced`: at the agent's **first pre-flop decision**, a per-hand seeded coin
+  flip decides raise vs call/check. Both arms see the same forced action on the
+  same deal, but it no longer depends on the agent's cards.
+
+The proxy is real. Under `greedy`, the opening raise rate is `0.0-0.4 %` in the
+weakest quarter of hole-card strength and `72.9-86.8 %` in the strongest quarter.
+Under `forced`, the same rates are `50.1 %` and `52.2 %`: the cards no longer
+predict the action.
+
+Zeroing the GRU, history-on minus history-zeroed (bb/hand, 2,000 deals per cell):
+
+| condition | seed 0 | seed 1 | seed 2 | mean |
+|---|---|---|---|---|
+| greedy | −0.0175 ±0.0322 | +0.0065 ±0.0260 | −0.0085 ±0.0264 | −0.0065 |
+| forced opening | −0.0045 ±0.0265 | −0.0075 ±0.0242 | **+0.0225 ±0.0223** | +0.0035 |
+
+The greedy column reproduces the matrix result exactly (`−0.0065`), which
+validates the harness. Breaking the proxy does not revive reliance: the forced
+mean is `+0.0035` bb/hand and only one of six cells resolves. Forcing also drops
+EV from roughly `+0.66` to `+0.30` bb/hand, confirming that the opening action is
+genuinely different and that the trained pre-flop policy is much better than a
+coin flip.
+
+The conclusion is therefore stronger than "the proxy masks memory": even when
+the features cannot know whether the agent opened, the trained network still
+does not use the channel. The training-time benefit is a learning effect that is
+not retained in the weights, not a decision-time capability hidden by
+redundancy.
+
 ### Verdict
 
 **Memory pays during training, not at decision time, for this opponent.**
@@ -1609,7 +1649,10 @@ benefited from memory.
    three held-out opponents (3/3 seeds each, one resolved each). This is the
    first consistent payoff advantage for memory in the project.
 2. The advantage is not retained in the weights: zeroing the trained channel
-   costs `0.007` bb/hand and changes about 1 % of decisions.
+   costs `0.007` bb/hand and changes about 1 % of decisions. Breaking the
+   features-only proxy at evaluation time does not change that (`+0.0035`
+   bb/hand, 1/6 cells resolved), so the channel is not decision-relevant even
+   when the proxy is unavailable.
 3. The mid-training reliance peak is consistent with the pre-registered caveat.
    The hidden fact is **the agent's own first pre-flop raise**, because making
    the two lines collide requires the agent to act differently in them. A
@@ -1701,9 +1744,10 @@ rests on.
 * **The Stage 3 benefit is a training-time effect, not retained memory.** The
   history arm beats the control by `+0.276` bb/hand on the training opponent,
   but zeroing the GRU in the trained network is worth about `0` and the policy
-  changes about 1 % of decisions when it is removed. The likely reason is the
-  design caveat: the hidden fact is the agent's own pre-flop raise, and a
-  deterministic card-based preflop policy can recover it. The iteration-20
+  changes about 1 % of decisions when it is removed. Breaking the card-based
+  proxy at evaluation time (`scripts/proxy_break.py`: random opening action)
+  does not revive reliance either (`+0.0035` bb/hand, 1/6 cells resolved), so
+  this is not merely redundancy masking a usable signal. The iteration-20
   reliance peak is consistent with a scaffold that the trunk later absorbs, but
   that mechanism is inferred, not proven.
 * **The hidden-mode opponent is imperfect.** `FirstRaiserBettor` can misclassify
@@ -1747,18 +1791,21 @@ bb/hand and changes about 1 % of decisions: the final policy has distilled the
 hidden variable into a features-only proxy. The pre-registered caveat -- the
 hidden fact is the agent's own pre-flop raise -- is the most likely reason.
 
-**Recommended next milestone: test the scaffold hypothesis and remove the
-proxy.** The remaining question is whether memory can be made *decision-relevant*
-rather than a learning aid. Two cheap experiments would settle it:
+**Recommended next milestone: remove the proxy during training.** The remaining
+question is whether memory can be made *decision-relevant* rather than a
+learning aid. The first diagnostic is done: the trained policy's opening action
+is a sharp function of hole-card strength (raise rate `0.0-0.4 %` in the weakest
+quarter, `72.9-86.8 %` in the strongest), so the mode is recoverable without
+memory. Forcing a random opening action removes that proxy, but zeroing the GRU
+is then still worth only `+0.0035` bb/hand (1/6 cells resolved), so the benefit
+is not merely hidden by redundancy.
 
-1. Measure whether the trained B policy's pre-flop action is a deterministic
-   function of its hole cards and position. If it is, the mode is recoverable
-   without memory, exactly as predicted, and the `+0.276` is a training effect.
-2. Retrain the history and control arms with a genuinely mixed pre-flop policy
-   (a higher entropy coefficient, or sampled evaluation instead of greedy) so
-   that the agent cannot reconstruct its own past action from its cards. If
-   memory is decision-relevant, the within-checkpoint ablation should grow; if
-   it stays at zero, the channel is not worth its parameters at this scale.
+The remaining experiment is to retrain the history and control arms with a
+genuinely mixed pre-flop policy (a higher entropy coefficient, or entropy applied
+to pre-flop decisions only) so that the agent cannot reconstruct its own past
+action from its cards even at convergence. If memory is decision-relevant, the
+within-checkpoint ablation should grow; if it stays at zero, the channel is not
+worth its parameters at this scale.
 
 A stronger environment change would hide a fact that is *not* the agent's own
 action, but that is hard in heads-up limit hold'em: the observation already
@@ -1824,6 +1871,13 @@ A sensible remaining Stage 2 scope:
     cell. Training with history is worth `+0.276` bb/hand over the control on
     the training opponent, but the ablation is `-0.007` and reliance is about
     1 % of decisions: memory pays during training, not at decision time.
-18. Test the scaffold hypothesis: measure the determinism of B's pre-flop
-    policy, then retrain with a mixed pre-flop policy so the agent cannot
-    recover its own past action from its cards. Next.
+18. ~~Measure whether B's pre-flop action is a deterministic function of its
+    hole cards and position, and whether breaking that proxy revives
+    decision-time reliance.~~ ✅ The greedy opening raise rate is `0.0-0.4 %` in
+    the weakest hole-card quarter and `72.9-86.8 %` in the strongest, so the
+    proxy is real. Forcing a random opening action breaks it, but the ablation
+    is still `+0.0035` bb/hand (1/6 cells resolved): the trained network does not
+    use memory even when the proxy is unavailable. `scripts/proxy_break.py`.
+19. Retrain the history and control arms with a genuinely mixed pre-flop policy
+    so the agent cannot reconstruct its own past action from its cards at all.
+    Next.
