@@ -10,10 +10,10 @@ import pytest
 import torch
 from torch.distributions import Categorical
 
-from poker_arena.encoding import FEATURE_DIM, ObservationEncoder
+from poker_arena.encoding import FEATURE_DIM, ObservationEncoder, STREET_SLICE
 from poker_arena.environment import make_environment
 from poker_arena.networks import NUM_ACTIONS, PolicyValueNet
-from poker_arena.ppo import PPOConfig, PPOUpdater
+from poker_arena.ppo import PPOConfig, PPOUpdater, entropy_terms, run_ppo_update
 from poker_arena.rollout import RolloutBatch, RolloutBuffer, collect_trajectories
 
 
@@ -78,6 +78,7 @@ def test_default_config_is_pinned():
 
     assert config.clip_epsilon == 0.2
     assert config.entropy_coef == 0.01
+    assert config.entropy_coef_preflop == 0.0
     assert config.value_coef == 0.5
     assert config.epochs == 4
     assert config.minibatch_size == 256
@@ -93,6 +94,7 @@ def test_default_config_is_pinned():
         {"clip_epsilon": 0.0},
         {"clip_epsilon": 1.0},
         {"entropy_coef": -0.1},
+        {"entropy_coef_preflop": -0.1},
         {"value_coef": -0.1},
         {"epochs": 0},
         {"minibatch_size": 0},
@@ -374,6 +376,88 @@ def test_step_leaves_the_network_in_training_mode(net):
     net.eval()
     PPOUpdater(net, seed=0).step(_synthetic_batch(net))
     assert net.training
+
+
+def test_entropy_terms_split_the_marked_rows():
+    entropy = torch.tensor([1.0, 3.0, 5.0, 7.0])
+    weights = torch.tensor([1.0, 0.0, 1.0, 0.0])
+
+    mean, preflop = entropy_terms(entropy, weights)
+
+    assert mean.item() == pytest.approx(4.0)
+    assert preflop is not None
+    assert preflop.item() == pytest.approx(3.0)
+
+
+def test_entropy_terms_without_weights_is_the_plain_mean():
+    entropy = torch.tensor([1.0, 3.0, 5.0])
+
+    mean, preflop = entropy_terms(entropy)
+
+    assert mean.item() == pytest.approx(3.0)
+    assert preflop is None
+
+
+def test_entropy_terms_with_no_marked_rows_falls_back_to_the_mean():
+    entropy = torch.tensor([1.0, 3.0])
+
+    mean, preflop = entropy_terms(entropy, torch.zeros(2))
+
+    assert mean.item() == pytest.approx(2.0)
+    assert preflop is None
+
+
+def _batch_with_streets(batch: RolloutBatch) -> RolloutBatch:
+    """Mark the first half of the rows pre-flop and the second half flop."""
+
+    features = batch.features.copy()
+    features[:, STREET_SLICE] = 0.0
+    half = features.shape[0] // 2
+    features[:half, STREET_SLICE.start] = 1.0
+    features[half:, STREET_SLICE.start + 1] = 1.0
+    return replace(batch, features=features)
+
+
+def test_preflop_entropy_coefficient_is_reported_and_scoped(net):
+    batch = _batch_with_streets(_synthetic_batch(net))
+    config = PPOConfig(
+        entropy_coef=0.0,
+        entropy_coef_preflop=0.1,
+        value_coef=0.0,
+        epochs=1,
+        minibatch_size=len(batch),
+    )
+
+    stats = PPOUpdater(net, config, seed=0).step(batch)
+
+    assert stats["preflop_fraction"] == pytest.approx(0.5)
+    assert np.isfinite(stats["entropy_preflop"])
+    assert stats["entropy_preflop"] >= 0.0
+
+
+def test_preflop_entropy_weights_must_be_valid(net):
+    batch = _synthetic_batch(net)
+    config = PPOConfig(entropy_coef_preflop=0.1)
+    updater = PPOUpdater(net, config, seed=0)
+
+    def forward(index):
+        return torch.zeros(len(index), NUM_ACTIONS), torch.zeros(len(index))
+
+    with pytest.raises(ValueError):
+        run_ppo_update(
+            net=net,
+            config=config,
+            optimizer=updater.optimizer,
+            generator=None,
+            count=len(batch),
+            forward=forward,
+            actions=batch.actions,
+            log_probs=batch.log_probs,
+            values=batch.values,
+            advantages=batch.advantages,
+            returns=batch.returns,
+            entropy_weights=np.full(len(batch), -1.0),
+        )
 
 
 # -- validation ------------------------------------------------------------

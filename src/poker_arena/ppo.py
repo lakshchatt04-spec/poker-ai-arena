@@ -64,7 +64,7 @@ import torch
 from torch import Tensor, nn
 from torch.distributions import Categorical
 
-from .encoding import FEATURE_DIM
+from .encoding import FEATURE_DIM, preflop_rows
 from .networks import NUM_ACTIONS, PolicyValueNet
 from .rollout import RolloutBatch, normalize_advantages
 
@@ -82,6 +82,11 @@ class PPOConfig:
     #: Weight on the entropy bonus.  Small: enough to delay collapse, not enough
     #: to fight the policy gradient.
     entropy_coef: float = 0.01
+    #: Extra entropy weight applied to pre-flop decisions only.  Zero leaves the
+    #: update identical to :attr:`entropy_coef`.  Raising it keeps the opening
+    #: action stochastic, so the agent's own cards cannot reveal which action it
+    #: took -- the point of the pre-flop-proxy experiment.
+    entropy_coef_preflop: float = 0.0
     #: Weight on the value loss, kept near 0.5 so critic and actor learn together.
     value_coef: float = 0.5
     #: Divide the value targets by the rollout's return standard deviation, so
@@ -107,6 +112,11 @@ class PPOConfig:
         if float(self.entropy_coef) < 0.0:
             raise ValueError(
                 f"entropy_coef must be non-negative, got {self.entropy_coef!r}"
+            )
+        if float(self.entropy_coef_preflop) < 0.0:
+            raise ValueError(
+                "entropy_coef_preflop must be non-negative, got "
+                f"{self.entropy_coef_preflop!r}"
             )
         if float(self.value_coef) < 0.0:
             raise ValueError(
@@ -176,6 +186,8 @@ class PPOUpdater:
         features = torch.as_tensor(np.ascontiguousarray(batch.features))
         legal_masks = torch.as_tensor(np.ascontiguousarray(batch.legal_masks))
 
+        entropy_weights = preflop_rows(batch.features).astype(np.float64)
+
         def forward(index: Tensor) -> tuple[Tensor, Tensor]:
             # Agent A's network reads only the observation and the legal mask.
             return self.net(features[index], legal_masks[index])
@@ -192,7 +204,27 @@ class PPOUpdater:
             values=batch.values,
             advantages=batch.advantages,
             returns=batch.returns,
+            entropy_weights=entropy_weights,
         )
+
+
+def entropy_terms(
+    entropy_by_row: Tensor, weights: Tensor | None = None
+) -> tuple[Tensor, Tensor | None]:
+    """Return the mean entropy and, when weighted, the marked rows' mean.
+
+    ``weights`` marks the rows that receive the extra coefficient.  The weighted
+    mean is normalised by the total weight, so the bonus does not shrink merely
+    because a batch contains few marked rows.
+    """
+
+    mean = entropy_by_row.mean()
+    if weights is None:
+        return mean, None
+    total = weights.sum()
+    if float(total) <= 0.0:
+        return mean, None
+    return mean, (entropy_by_row * weights).sum() / total
 
 
 def run_ppo_update(
@@ -208,6 +240,7 @@ def run_ppo_update(
     values: np.ndarray,
     advantages: np.ndarray,
     returns: np.ndarray,
+    entropy_weights: np.ndarray | None = None,
 ) -> dict[str, float | int]:
     """Run the clipped PPO update over one fixed batch of decisions.
 
@@ -233,6 +266,10 @@ def run_ppo_update(
         values: ``(count,)`` critic estimates from the sampling forward pass.
         advantages: ``(count,)`` raw advantages; normalised here if configured.
         returns: ``(count,)`` value targets.
+        entropy_weights: Optional ``(count,)`` non-negative weights.  When given,
+            ``entropy_coef_preflop`` multiplies the weighted mean entropy over
+            the marked rows (the caller marks pre-flop decisions), instead of
+            spreading the bonus over every decision.
 
     Returns:
         Batch-mean diagnostics plus the critic's explained variance and the
@@ -244,6 +281,19 @@ def run_ppo_update(
         if config.normalize_advantages
         else np.asarray(advantages, dtype=np.float32)
     )
+
+    entropy_weights_tensor: Tensor | None = None
+    if entropy_weights is not None:
+        weights = np.asarray(entropy_weights, dtype=np.float64)
+        if weights.shape != (int(count),):
+            raise ValueError(
+                f"entropy_weights must be ({int(count)},), got {weights.shape}"
+            )
+        if not np.isfinite(weights).all() or (weights < 0.0).any():
+            raise ValueError(
+                "entropy_weights must be finite and non-negative"
+            )
+        entropy_weights_tensor = torch.as_tensor(weights)
 
     # Diagnostics about the critic that produced this rollout.  Measured
     # before any gradient step, so it describes the sampling policy's own
@@ -279,6 +329,7 @@ def run_ppo_update(
         "policy_loss": 0.0,
         "value_loss": 0.0,
         "entropy": 0.0,
+        "entropy_preflop": 0.0,
         "total_loss": 0.0,
         "approx_kl": 0.0,
         "clip_fraction": 0.0,
@@ -286,6 +337,7 @@ def run_ppo_update(
     }
     visited = 0
     minibatches = 0
+    preflop_visited = 0
 
     net.train()
 
@@ -299,7 +351,12 @@ def run_ppo_update(
             logits, batch_values = forward(index)
             distribution = Categorical(logits=logits)
             new_log_probs = distribution.log_prob(actions_tensor[index])
-            entropy = distribution.entropy().mean()
+            entropy, entropy_preflop = entropy_terms(
+                distribution.entropy(),
+                None
+                if entropy_weights_tensor is None
+                else entropy_weights_tensor[index],
+            )
 
             # old_log_probs is a stored constant: this subtraction is what
             # makes the ratio a ratio rather than an identity.
@@ -317,9 +374,16 @@ def run_ppo_update(
                 (batch_values - returns_tensor[index]) / return_scale
             ).pow(2).mean()
 
+            entropy_bonus = float(config.entropy_coef) * entropy
+            if entropy_preflop is not None:
+                entropy_bonus = (
+                    entropy_bonus
+                    + float(config.entropy_coef_preflop) * entropy_preflop
+                )
+
             loss = (
                 policy_loss
-                - float(config.entropy_coef) * entropy
+                - entropy_bonus
                 + float(config.value_coef) * value_loss
             )
 
@@ -340,6 +404,11 @@ def run_ppo_update(
             totals["policy_loss"] += float(policy_loss.detach()) * weight
             totals["value_loss"] += float(value_loss.detach()) * weight
             totals["entropy"] += float(entropy.detach()) * weight
+            if entropy_preflop is not None:
+                totals["entropy_preflop"] += (
+                    float(entropy_preflop.detach()) * weight
+                )
+                preflop_visited += weight
             totals["total_loss"] += float(loss.detach()) * weight
             totals["approx_kl"] += float(approx_kl) * weight
             totals["clip_fraction"] += float(clip_fraction) * weight
@@ -348,8 +417,17 @@ def run_ppo_update(
             minibatches += 1
 
     stats: dict[str, float | int] = {
-        name: total / visited for name, total in totals.items()
+        name: total / visited
+        for name, total in totals.items()
+        if name != "entropy_preflop"
     }
+    if entropy_weights_tensor is not None:
+        stats["entropy_preflop"] = (
+            totals["entropy_preflop"] / preflop_visited
+            if preflop_visited
+            else 0.0
+        )
+        stats["preflop_fraction"] = float(entropy_weights_tensor.mean())
     stats["explained_variance"] = explained_variance
     stats["return_std"] = return_std
     stats["epochs"] = int(config.epochs)

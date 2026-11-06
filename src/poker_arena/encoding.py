@@ -79,6 +79,26 @@ SMALL_BLIND_INDEX = TO_CALL_INDEX + 1
 #: Width of :attr:`EncodedState.features`.
 FEATURE_DIM = SMALL_BLIND_INDEX + 1
 
+#: Index of the pre-flop slot inside the street one-hot block.
+PREFLOP_STREET_INDEX = STREET_SLICE.start
+
+
+def preflop_rows(features: np.ndarray) -> np.ndarray:
+    """Return a boolean ``(N,)`` mask marking pre-flop decisions.
+
+    The encoder writes exactly one street one-hot per row, so the pre-flop slot
+    identifies the street without threading a separate array through the rollout
+    buffers.  The PPO update uses this to apply an entropy bonus to opening
+    decisions only.
+    """
+
+    array = np.asarray(features)
+    if array.ndim != 2 or array.shape[1] != FEATURE_DIM:
+        raise ValueError(
+            f"features must be (N, {FEATURE_DIM}), got {array.shape}"
+        )
+    return array[:, PREFLOP_STREET_INDEX] > 0.5
+
 
 @dataclass(frozen=True)
 class EncodedState:

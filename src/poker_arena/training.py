@@ -329,6 +329,8 @@ TRAIN_FIELDS = (
     "explained_variance",
     "return_std",
     "entropy",
+    "entropy_preflop",
+    "preflop_fraction",
     "total_loss",
     "approx_kl",
     "clip_fraction",

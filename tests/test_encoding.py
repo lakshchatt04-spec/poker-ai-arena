@@ -20,6 +20,7 @@ from poker_arena.encoding import (
     TO_CALL_INDEX,
     EncodedState,
     ObservationEncoder,
+    preflop_rows,
     small_blind_player,
     validate_environment_contract,
 )
@@ -183,6 +184,26 @@ def test_street_one_hot_matches_the_board_size(env, encoder):
         assert encoded.street == expected
         assert int(np.argmax(encoded.features[STREET_SLICE])) == expected
         assert encoded.features[STREET_SLICE].sum() == 1.0
+
+
+def test_preflop_rows_uses_the_street_one_hot(env, encoder):
+    preflop = encoder.encode(
+        _state(env, hand=[0, 1], board=[], chips=[1, 2], my_chips=1),
+        is_small_blind=False,
+    )
+    flop = encoder.encode(
+        _state(env, hand=[0, 1], board=[10, 11, 12], chips=[1, 2], my_chips=1),
+        is_small_blind=False,
+    )
+
+    mask = preflop_rows(np.stack([preflop.features, flop.features]))
+
+    assert mask.tolist() == [True, False]
+
+
+def test_preflop_rows_rejects_the_wrong_width():
+    with pytest.raises(ValueError):
+        preflop_rows(np.zeros((3, FEATURE_DIM - 1), dtype=np.float32))
 
 
 def test_impossible_board_size_is_rejected(env, encoder):

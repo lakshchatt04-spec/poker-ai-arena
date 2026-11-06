@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from .encoding import FEATURE_DIM
+from .encoding import FEATURE_DIM, preflop_rows
 from .history import MAX_HISTORY_TOKENS, TOKEN_DIM
 from .networks import NUM_ACTIONS
 from .networks_b import HistoryPolicyValueNet, validate_history
@@ -76,6 +76,8 @@ class HistoryPPOUpdater:
         # actually depends on, after the numpy -> torch conversion.
         validate_history(tokens, history_masks)
 
+        entropy_weights = preflop_rows(batch.features).astype(np.float64)
+
         def forward(index: Tensor) -> tuple[Tensor, Tensor]:
             return self.net(
                 features[index],
@@ -96,6 +98,7 @@ class HistoryPPOUpdater:
             values=batch.values,
             advantages=batch.advantages,
             returns=batch.returns,
+            entropy_weights=entropy_weights,
         )
 
 

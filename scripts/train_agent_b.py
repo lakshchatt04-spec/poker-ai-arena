@@ -136,6 +136,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Adam learning rate (default: 3e-4)",
     )
     parser.add_argument(
+        "--preflop-entropy-coef", type=float, default=0.0,
+        help="extra entropy weight on pre-flop decisions only, keeping the "
+             "opening action stochastic (default: 0.0)",
+    )
+    parser.add_argument(
         "--history-hidden", type=_positive_int, default=HISTORY_HIDDEN,
         help=f"width of the GRU state (default: {HISTORY_HIDDEN})",
     )
@@ -160,13 +165,19 @@ def _config_from(args: argparse.Namespace) -> TrainingConfigB:
         run_name=args.run_name,
         log_dir=args.log_dir,
         checkpoint_dir=args.checkpoint_dir,
-        ppo=PPOConfig(learning_rate=args.learning_rate),
+        ppo=PPOConfig(
+            learning_rate=args.learning_rate,
+            entropy_coef_preflop=args.preflop_entropy_coef,
+        ),
         history_hidden=args.history_hidden,
         use_history=not args.no_history,
     )
 
 
-def _format_row(row: dict[str, float | int]) -> str:
+def _format_row(row: dict[str, float | int], *, preflop: bool) -> str:
+    preflop_column = ""
+    if preflop:
+        preflop_column = f"{float(row['entropy_preflop']):>9.4f}"
     return (
         f"{int(row['iteration']):>5}"
         f"{int(row['decisions']):>11}"
@@ -174,6 +185,7 @@ def _format_row(row: dict[str, float | int]) -> str:
         f"{float(row['value_loss']):>8.4f}"
         f"{float(row['explained_variance']):>8.2f}"
         f"{float(row['entropy']):>9.4f}"
+        f"{preflop_column}"
         f"{float(row['approx_kl']):>8.4f}"
         f"{float(row['clip_fraction']):>7.2f}"
         f"{float(row['grad_norm']):>7.3f}"
@@ -217,18 +229,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f"ppo: clip {config.ppo.clip_epsilon}  entropy {config.ppo.entropy_coef}"
+        f"  pre-flop entropy {config.ppo.entropy_coef_preflop}"
         f"  value {config.ppo.value_coef}  epochs {config.ppo.epochs}"
         f"  minibatch {config.ppo.minibatch_size}  lr {config.ppo.learning_rate}"
     )
     print()
 
+    show_preflop = float(config.ppo.entropy_coef_preflop) > 0.0
+    preflop_header = f"{'pre-ent':>9}" if show_preflop else ""
     print(
         f"{'iter':>5}{'decisions':>11}{'policy':>9}{'value':>8}{'EV':>8}"
-        f"{'entropy':>9}{'KL':>8}{'clip':>7}{'grad':>7}"
+        f"{'entropy':>9}{preflop_header}{'KL':>8}{'clip':>7}{'grad':>7}"
     )
 
     def progress(row, records) -> None:
-        print(_format_row(row), flush=True)
+        print(_format_row(row, preflop=show_preflop), flush=True)
         for record in records or ():
             result = record.result
             print(
