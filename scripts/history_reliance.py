@@ -69,6 +69,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--arm", default="history",
                         choices=["history", "control"],
                         help="which training arm's checkpoints to test")
+    parser.add_argument("--iteration", type=int, default=50,
+                        help="checkpoint iteration to test (default: 50)")
     return parser.parse_args(argv)
 
 
@@ -156,16 +158,16 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(f"opponent      : {args.opponent}")
     print(f"deals         : {args.hands}   base seed {args.seed}")
-    print(f"arm           : {args.arm}")
+    print(f"arm           : {args.arm}   iteration {args.iteration}")
     print()
     print("                  decisions   action changes   mean |logit shift|")
     print("                  ---------   --------------   ------------------")
 
     for seed in args.seeds:
         name = (
-            f"agent_b_seed{seed}_0050.pt"
+            f"agent_b_seed{seed}_{args.iteration:04d}.pt"
             if args.arm == "history"
-            else f"agent_b_control_seed{seed}_0050.pt"
+            else f"agent_b_control_seed{seed}_{args.iteration:04d}.pt"
         )
         path = directory / name
         if not path.is_file():

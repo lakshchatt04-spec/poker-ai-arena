@@ -13,17 +13,26 @@ Two agents will eventually be trained with PPO and compared:
 **Research question:** *Does recurrent memory of opponent actions improve
 reinforcement-learning performance in heads-up poker?*
 
-**Current stage: complete through Stage 4, with a negative answer to the research
-question.** Agent A (feed-forward MLP) is trained, hardened across three seeds and
-frozen; it beats a passive caller and transfers to a held-out raiser style. Agent
-B adds a GRU over the betting history, is trained with an identical protocol and
-compared against a capacity-matched control arm on 2,000 shared deals per cell.
-Training with memory is worth `+0.007` to `+0.020` bb/hand over the control with
-the sign flipping across seeds; Agent B is not measurably better than Agent A; and
-zeroing the channel in a trained network costs under `0.01` bb/hand even though
-the policy reads it on 1–2 % of decisions. The body of the README reports the
-numbers, the four lines of evidence, and why the likely cause is redundancy with
-the 131-feature observation rather than an implementation defect.
+**Current stage: complete through Stage 5, with a qualified answer to the
+research question.** Against the original memoryless scripted opponents, memory
+does not pay: training with the channel was worth `+0.007` to `+0.020` bb/hand
+over a capacity-matched control with the sign flipping across seeds, and zeroing
+the channel cost under `0.01` bb/hand. Against `first_raiser`, a bot whose
+post-flop play depends on a fact the 131-feature observation cannot encode,
+training with memory is worth **`+0.276` bb/hand over the control** on the
+training opponent (3/3 seeds positive, 2/3 resolved) and is positive on every
+held-out opponent (3/3 seeds each). But the trained policy still barely uses the
+channel: the within-checkpoint ablation is `-0.007` bb/hand and removing it
+changes only 0.4-1.3 % of greedy actions. The evidence points to memory acting
+as a **training-time scaffold**: it lets PPO find the mode-conditional strategy,
+after which the trunk absorbs a features-only proxy for the mode.
+
+That is exactly the failure mode predicted when the opponent was designed.
+Reaching the same chips and raise count in both modes requires the agent to act
+differently, so a deterministic card-based preflop policy can recover the mode
+without memory. The body of the README reports both experiments, the
+identifiability probes, the paired matrices, the reliance curves, and the
+limitations.
 
 Stage 1 exists so later results are not built on guesses about RLCard's
 observations, actions, payoffs or history handling. The history encoding is data
@@ -43,6 +52,7 @@ poker-ai-arena/
 │       ├── history.py              # Agent B's betting-history tokens
 │       ├── networks.py             # Agent A's policy/value MLP
 │       ├── networks_b.py           # Agent A's trunk + a GRU over the history
+│       ├── opponents.py            # scripted bots whose play depends on the action order
 │       ├── ppo.py                  # clipped PPO update (shared core)
 │       ├── ppo_b.py                # the same update with history tensors
 │       ├── rollout.py              # rollout buffer + GAE for the PPO update
@@ -63,6 +73,7 @@ poker-ai-arena/
 │   ├── compare_agents.py           # A/B, control-arm and history-ablation comparison
 │   ├── compare_matrix.py           # the whole seed x opponent matrix, one table
 │   ├── history_reliance.py         # how often removing memory changes the action
+│   ├── history_probe.py            # is the opponent's hidden mode in the observation?
 │   ├── train_agent_a.py            # trains Agent A and evaluates it
 │   └── train_agent_b.py            # trains Agent B (or its control arm)
 ├── tests/
@@ -73,6 +84,7 @@ poker-ai-arena/
 │   ├── test_environment.py         # Stage 1 contract tests + reset correction
 │   ├── test_history.py             # history-encoding tests
 │   ├── test_networks.py            # network tests
+│   ├── test_opponents.py           # hidden-mode collisions on real RLCard states
 │   ├── test_ppo.py                 # PPO-update tests
 │   ├── test_rollout.py             # rollout and GAE tests
 │   └── test_training.py            # training-loop and evaluation tests
@@ -1357,7 +1369,7 @@ baseline** (mean 1.67 % against 0.56 %), and its mean maximum logit shift is
 larger (`0.27-0.43` against `0.19-0.24`). So the trained networks do read the
 channel -- it is not dead -- but they act on it rarely.
 
-### Paired results: memory does not pay for itself
+### Paired results: memory does not pay against these opponents
 
 `scripts/compare_matrix.py`, 2,000 paired deals per cell, three seeds. Positive
 means the first policy out-earned the second. `random` is not a training or
@@ -1409,8 +1421,8 @@ is a quarter of a small blind.
 
 ### Verdict
 
-**Memory of the opponent's actions does not pay for itself in this game, at this
-scale.** Four independent lines agree:
+**Memory of the opponent's actions does not pay for itself against the three
+scripted style opponents, at this scale.** Four independent lines agree:
 
 1. Training with the channel is worth `+0.007` to `+0.020` bb/hand over the
    capacity-matched control, with the sign changing across seeds.
@@ -1441,14 +1453,18 @@ transfer to an opponent with no pattern at all.
 
 ### What this changes about the project
 
-The architecture question is answered negatively for this game and this size of
-network, which is a result, not a dead end. The remaining follow-ups that would
-move the needle are all about the environment, not the model: train against a
-population of opponents that differ in a *history-dependent* way (for example one
-that check-raises only after being raised twice), because that is the only
-situation in which the token stream carries information the observation cannot.
-Adding capacity or tuning PPO further would just chase deal variance, as the
-Agent A hardening pass already showed.
+This verdict is about the original memoryless opponent set. Stage 3 below
+reopens the question with a genuinely history-dependent opponent and finds a
+material training-time benefit, though not retained decision-time reliance.
+
+The architecture question is answered negatively for these opponents, which is a
+result, not a dead end. The remaining follow-ups that would move the needle are
+all about the environment, not the model: train against a population of
+opponents that differ in a *history-dependent* way (for example one that
+check-raises only after being raised twice), because that is the only situation
+in which the token stream carries information the observation cannot. Adding
+capacity or tuning PPO further would just chase deal variance, as the Agent A
+hardening pass already showed.
 
 ---
 
@@ -1517,7 +1533,102 @@ largest when that policy is genuinely mixed. The nine-run experiment (A, B and
 the capacity-matched B-control, three seeds each, all trained against
 `first_raiser`) measures which effect wins.
 
+### The nine-run experiment: what memory buys
 
+All three arms are trained identically for 50 iterations (320 hands per
+iteration, half self-play and half against `first_raiser`) and differ only in
+the network: frozen Agent A, Agent B with the history channel, and B's
+capacity-matched control. Each is run at seeds 0, 1 and 2. The final in-run
+evaluation (2,000 hands per opponent) is:
+
+| arm | first_raiser | passive | raiser_strong | raiser_loose |
+|---|---|---|---|---|
+| A (MLP) | +0.412 ±0.096 | +0.210 ±0.062 | −0.161 ±0.092 | +0.241 ±0.058 |
+| B (history) | **+0.606 ±0.134** | +0.264 ±0.043 | −0.081 ±0.072 | +0.276 ±0.067 |
+| B control | +0.342 ±0.117 | +0.162 ±0.078 | −0.200 ±0.107 | +0.143 ±0.074 |
+
+Entries are mean ± sd across the three seeds, in bb/hand. These are separate
+runs, not paired deals, so they are descriptive. The test is the paired matrix
+below (2,000 identical deals per cell; positive = history minus control):
+
+| opponent | seed 0 | seed 1 | seed 2 | mean | seeds same sign |
+|---|---|---|---|---|---|
+| first_raiser | +0.2795 (yes) | +0.4730 (yes) | +0.0760 | **+0.2762** | 3/3 |
+| passive | +0.1465 (yes) | +0.0580 | +0.0095 | +0.0713 | 3/3 |
+| raiser_strong | +0.1890 (yes) | +0.0460 | +0.0020 | +0.0790 | 3/3 |
+| raiser_loose | +0.2385 (yes) | +0.1360 | +0.0235 | +0.1327 | 3/3 |
+
+"yes" means the per-seed paired 95 % interval excludes zero. All twelve
+seed-opponent cells point the same way, five resolve individually, and the
+largest effect is against the opponent whose strategy actually depends on the
+history. The seed-to-seed spread is large (`sd 0.199` against `first_raiser`),
+so the honest summary is the sign consistency and the per-seed intervals, not
+the three-seed mean's own interval.
+
+### The advantage is not retained at decision time
+
+The ablation is the tight test. It takes the trained B network and zeroes the
+GRU output (`use_history=False`) on the *same weights* and the same deals:
+
+| opponent | mean history-on minus history-zeroed | resolved seeds |
+|---|---|---|
+| first_raiser | −0.0065 | 0/3 |
+| passive | +0.0015 | 1/3 (`+0.0110`) |
+| raiser_strong | −0.0003 | 0/3 |
+| raiser_loose | +0.0017 | 0/3 |
+
+Zeroing the channel moves the payoff by at most `0.007` bb/hand in expectation,
+against the `0.276` bb/hand that training with it was worth. The reliance
+diagnostic says the same thing directly: on a fixed state distribution at
+iteration 50, turning the channel off changes the greedy action on
+`1.11 / 0.37 / 1.35 %` of decisions for seeds 0/1/2 (mean `0.94 %`), with a mean
+absolute logit shift of `0.26-0.40`; the control weights, which never saw the
+channel, change `0.11-0.20 %` with a shift of `0.11-0.17`.
+
+Tracking reliance across checkpoints explains how the two results fit together.
+Mean action-change rate when the channel is zeroed:
+
+| iteration | 10 | 20 | 30 | 40 | 50 |
+|---|---|---|---|---|---|
+| mean over seeds | 0.04 % | 2.05 % | 1.00 % | 0.94 % | 0.94 % |
+
+Reliance rises while the policy is learning, peaks around iteration 20, and then
+falls as payoff continues to improve. The reading is that the GRU helps PPO
+discover the mode-conditional response, and the trunk subsequently absorbs the
+same information into a features-only representation. The final policy is
+therefore close to memoryless even though the training run that produced it
+benefited from memory.
+
+### Verdict
+
+**Memory pays during training, not at decision time, for this opponent.**
+
+1. Against the only opponent whose behaviour depends on the action sequence,
+   the history arm beats its capacity-matched control by `+0.276` bb/hand, is
+   positive in all three seeds and resolves in two. It is also positive on all
+   three held-out opponents (3/3 seeds each, one resolved each). This is the
+   first consistent payoff advantage for memory in the project.
+2. The advantage is not retained in the weights: zeroing the trained channel
+   costs `0.007` bb/hand and changes about 1 % of decisions.
+3. The mid-training reliance peak is consistent with the pre-registered caveat.
+   The hidden fact is **the agent's own first pre-flop raise**, because making
+   the two lines collide requires the agent to act differently in them. A
+   deterministic card-based pre-flop policy therefore lets the flop decision
+   recover the mode without memory. The GRU can learn that strategy faster than
+   the control, but the strategy itself is expressible without the GRU.
+4. Agent B is also slightly ahead of Agent A in the paired columns, most
+   clearly against `first_raiser` (`-0.137` for A minus B, 1/3 seeds resolved,
+   3/3 same sign) and unresolved elsewhere (`-0.048`, `-0.018`, `-0.034`).
+   B is 1.16x larger, so this is not a clean memory comparison and is reported
+   as secondary evidence.
+
+Two limitations bound the claim. The bot's intended mode is not realized
+perfectly: when it re-raises after the agent opened, it can misclassify itself
+as the first raiser, so mode-1 hands bet the flop only `70.7 %` of the time.
+That attenuates the effect, so `+0.276` is a lower bound on what a cleaner
+hidden-mode bot could produce. And three seeds with a `0.199` spread cannot
+resolve the three-seed mean; the per-seed paired intervals are what the verdict
+rests on.
 
 ## Known pitfalls
 
@@ -1580,21 +1691,25 @@ the capacity-matched B-control, three seeds each, all trained against
 * The encoder, the policy/value network, the rollout buffer, the PPO update and
   the training loop all exist. Agent B's network, rollout, PPO updater, training
   loop, checkpointing, paired comparison and history-reliance diagnostic are
-  implemented, tested and exercised on six runs.
+  implemented, tested and exercised on fifteen runs (the six original runs plus
+  the nine Stage 3 runs).
 * Agent B's comparison is confounded slightly by capacity: B has `+15.9 %` more
   parameters than A. The control arm (same capacity, no history input) removes
   that confound for the "memory vs no memory" question, but the headline A-vs-B
   number cannot separate memory from the wider heads. The verdict rests on the
   control arm and the ablation, not on the A-vs-B columns.
-* **The negative result is about this game and this opponent set.** In limit
-  hold'em the observation already implies most of what the action order reveals,
-  and none of the three scripted opponents behaves in a way that depends on the
-  history. The first history-dependent design (`c_bettor`) was confounded because
-  it announced its mode through the pot, but the `first_raiser` probe in Stage 3
-  finds a real gap: 29.3 % of post-flop decisions sit in card-free summaries that
-  appear under both modes, and history recovers the mode there (95.6 %) while the
-  observation alone is at chance (52.7 %). The nine-run A/B/control experiment is
-  the measurement of whether that gap survives training.
+* **The Stage 3 benefit is a training-time effect, not retained memory.** The
+  history arm beats the control by `+0.276` bb/hand on the training opponent,
+  but zeroing the GRU in the trained network is worth about `0` and the policy
+  changes about 1 % of decisions when it is removed. The likely reason is the
+  design caveat: the hidden fact is the agent's own pre-flop raise, and a
+  deterministic card-based preflop policy can recover it. The iteration-20
+  reliance peak is consistent with a scaffold that the trunk later absorbs, but
+  that mechanism is inferred, not proven.
+* **The hidden-mode opponent is imperfect.** `FirstRaiserBettor` can misclassify
+  itself as the first raiser when it re-raises after the agent opened, so its
+  intended post-flop mode is not always realized (`70.7 %` bet rate in mode 1).
+  This attenuates the measured training advantage and makes it a lower bound.
 * One unexplained cell: the history arm loses about `0.20` bb/hand to the
   control against a uniform-random opponent (2 of 3 seeds resolved). Random play
   is an out-of-distribution probe, not part of the protocol, and twelve
@@ -1620,24 +1735,36 @@ the capacity-matched B-control, three seeds each, all trained against
 | 2 | Agent A: observation encoding + MLP policy trained with PPO | ✅ done and frozen — three seeds positive on a held-out style |
 | 3 | Agent B: MLP + GRU over betting history, trained with PPO | ✅ done — three seeds trained, paired against the control arm |
 | 4 | Head-to-head evaluation, ablations and results write-up | ✅ done — paired matrix and verdict above |
-| 5 | History-dependent opponent, identifiability probe and nine-run follow-up | probe done — training in progress |
+| 5 | History-dependent opponent, identifiability probe and nine-run follow-up | ✅ done — memory helps training (`+0.276` bb/hand vs control) but not final decisions |
 
-**Verdict: the betting-history channel does not pay for itself.** Memory of the
-opponent's actions is worth `+0.007` to `+0.020` bb/hand over a capacity-matched
-control, with the sign flipping across seeds; Agent B is not measurably better
-than frozen Agent A; and zeroing the channel in a trained network costs under
-`0.01` bb/hand even though the policy reads it on 1-2 % of decisions. The most
-likely cause is redundancy with the 131-feature observation, not an
-implementation defect -- every other possible defect (masking, packing, the
-counterfactual state distribution) was checked and has a committed test.
+**Verdict: memory pays during training, not at decision time.** Against the
+original memoryless opponents it was worth nothing and the sign flipped across
+seeds. Against an opponent whose post-flop play depends on who opened the
+pre-flop betting, training with the channel is worth `+0.276` bb/hand over a
+capacity-matched control (3/3 seeds positive, 2/3 resolved) and is positive on
+all three held-out opponents. But zeroing the trained channel costs `0.007`
+bb/hand and changes about 1 % of decisions: the final policy has distilled the
+hidden variable into a features-only proxy. The pre-registered caveat -- the
+hidden fact is the agent's own pre-flop raise -- is the most likely reason.
 
-**Recommended next milestone: make the history matter or stop paying for it.**
-The architecture question is closed for this game at this scale. The only
-follow-up with a plausible positive result is an opponent whose behaviour is
-genuinely *history-dependent* -- for example one that check-raises only after
-being raised twice, so that the token stream carries something the observation
-cannot. That changes the environment, not the network. Re-tuning PPO or adding
-capacity would chase deal variance, as the Agent A hardening pass already showed.
+**Recommended next milestone: test the scaffold hypothesis and remove the
+proxy.** The remaining question is whether memory can be made *decision-relevant*
+rather than a learning aid. Two cheap experiments would settle it:
+
+1. Measure whether the trained B policy's pre-flop action is a deterministic
+   function of its hole cards and position. If it is, the mode is recoverable
+   without memory, exactly as predicted, and the `+0.276` is a training effect.
+2. Retrain the history and control arms with a genuinely mixed pre-flop policy
+   (a higher entropy coefficient, or sampled evaluation instead of greedy) so
+   that the agent cannot reconstruct its own past action from its cards. If
+   memory is decision-relevant, the within-checkpoint ablation should grow; if
+   it stays at zero, the channel is not worth its parameters at this scale.
+
+A stronger environment change would hide a fact that is *not* the agent's own
+action, but that is hard in heads-up limit hold'em: the observation already
+contains the chips and raise counts, so almost any opponent pattern is visible
+once it has acted. The current `first_raiser` design is the cleanest collision
+found so far, and its limitation is now measured rather than assumed.
 
 A sensible remaining Stage 2 scope:
 
@@ -1691,6 +1818,12 @@ A sensible remaining Stage 2 scope:
     observation is at chance (52.7 %) and history recovers the mode (95.6 %).
     The first attempt, `ContinuationBettor`, was rejected by the same probe as
     confounded (0 of 4,302 mixed states).
-17. Run Agent A, Agent B and the capacity-matched control against `first_raiser`
+17. ~~Run Agent A, Agent B and the capacity-matched control against `first_raiser`
     for three seeds each, then rerun `scripts/compare_matrix.py` and report
-    whether memory now pays for itself. Training in progress.
+    whether memory now pays for itself.~~ ✅ Nine runs, paired on 2,000 deals per
+    cell. Training with history is worth `+0.276` bb/hand over the control on
+    the training opponent, but the ablation is `-0.007` and reliance is about
+    1 % of decisions: memory pays during training, not at decision time.
+18. Test the scaffold hypothesis: measure the determinism of B's pre-flop
+    policy, then retrain with a mixed pre-flop policy so the agent cannot
+    recover its own past action from its cards. Next.
