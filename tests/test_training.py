@@ -171,6 +171,8 @@ def test_make_opponent_rejects_an_unknown_name():
         "raiser_strong",
         "raiser_loose",
         "random",
+        "c_bettor",
+        "first_raiser",
     }
 
 

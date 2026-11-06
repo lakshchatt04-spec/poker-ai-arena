@@ -41,6 +41,7 @@ from torch.distributions import Categorical
 from .encoding import FEATURE_DIM, ObservationEncoder, small_blind_player
 from .environment import ACTION_NAMES, reset_hand
 from .networks import PolicyValueNet
+from .opponents import notify_hand_start
 
 NUM_ACTIONS = len(ACTION_NAMES)
 
@@ -358,6 +359,8 @@ def collect_trajectories(
 
             state, player_id = reset_hand(env)
             small_blind = small_blind_player(state)
+            if opponent is not None:
+                notify_hand_start(opponent, state)
 
             while not env.is_over():
                 encoded = encoder.encode(

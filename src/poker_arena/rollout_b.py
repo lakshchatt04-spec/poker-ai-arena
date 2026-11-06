@@ -36,6 +36,7 @@ from .environment import NUM_PLAYERS, reset_hand
 from .history import MAX_HISTORY_TOKENS, TOKEN_DIM, HistorySequence, HistoryTracker
 from .networks import NUM_ACTIONS
 from .networks_b import HistoryPolicyValueNet
+from .opponents import notify_hand_start
 from .rollout import GAE_LAMBDA, GAMMA, compute_gae
 
 Opponent = Callable[[Mapping[str, Any], int], int]
@@ -306,6 +307,8 @@ def collect_history_trajectories(
             small_blind = small_blind_player(state)
             tracker = HistoryTracker()
             tracker.start_hand(state)
+            if opponent is not None:
+                notify_hand_start(opponent, state)
 
             while not env.is_over():
                 sequence = tracker.tokens(viewer=player_id)

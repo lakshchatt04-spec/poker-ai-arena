@@ -1452,6 +1452,73 @@ Agent A hardening pass already showed.
 
 ---
 
+## Stage 3: making the history matter
+
+The negative Agent B result is only about the opponents it trained against. The
+first attempt at a history-dependent bot, `c_bettor` (`ContinuationBettor`),
+turned out to be **confounded**: it raises pre-flop on a coin flip and then bets
+only when it was the pre-flop aggressor, but its own raise changes the pot and
+the raise count. A 3,000-hand identifiability probe found **0 of 4,302** agent
+decision states whose card-free betting summary appeared in both modes, and a
+features-only classifier recovered the mode at **100.0 %** on every street. The
+bot was announcing its hidden mode through the observation, so memory was
+redundant by construction. That result is why the probe now runs *before* any
+training compute is spent.
+
+`first_raiser` (`FirstRaiserBettor`) hides something the 131-feature observation
+cannot encode: **who made the first pre-flop raise**. It raises on a seeded coin
+flip at its first pre-flop decision, then bets or raises post-flop only when the
+*agent* opened the betting. With the bot on the small blind and the agent on the
+big blind, both lines reach the agent's first flop decision with identical cards,
+chips (`[4, 4]`), raise counts (`[1, 0, 0, 0]`) and street:
+
+* bot calls, agent raises, bot calls -- agent opened, so the bot bets the flop;
+* bot raises, agent calls, bot checks -- bot opened, so the bot stays passive.
+
+The action records differ, which is the only place the distinction lives. The
+collision is asserted on real RLCard states at ten seeds in
+`tests/test_opponents.py`, not just described in a comment.
+
+### The identifiability probe
+
+`scripts/history_probe.py` plays 3,000 deals against the bot (seed 20,000) and
+records every post-flop decision the agent faced. It groups states by the
+**card-free betting summary** (chips, per-street raise counts, street, pot,
+amount to call, blind flag), because cards are drawn independently of the mode.
+If a summary appears under both modes, no function of the observation can
+separate them. It then fits a hand-split logistic classifier to predict the mode
+from the observation, from the history tokens, and from both.
+
+| measurement | result |
+|---|---|
+| post-flop decision states | 4,089 |
+| decisions in mixed betting-summary groups | 1,200 (**29.3 %**) |
+| majority baseline, held-out hands | 57.5 % |
+| features only, all states | 85.2 % |
+| history tokens only, all states | 100.0 % |
+| features + history, all states | 98.6 % |
+| features only, **mixed groups only** (n = 296) | **52.7 %** |
+| features + history, **mixed groups only** | **95.6 %** |
+| mode 0 / mode 1 first flop action is a bet | 0.0 % / 70.7 % |
+
+Read the two mixed-group rows together: where the observation is provably
+ambiguous, features are at chance and the action sequence recovers the mode.
+That is the gap the original opponents never had. The overall 85.2 % features-only
+number is not a contradiction: most states sit in summaries that already
+determine the mode, and the classifier learns those.
+
+One caveat is worth stating before the training result. The hidden variable is
+**the agent's own first pre-flop raise**, because making the two lines reach the
+same chips and raise count requires the agent to act differently in them. A
+memoryless policy could therefore approximate the mode by learning a
+deterministic card-based pre-flop policy (raise with strong hands, call with
+weak ones) and reading its own cards at the flop. The GRU's advantage should be
+largest when that policy is genuinely mixed. The nine-run experiment (A, B and
+the capacity-matched B-control, three seeds each, all trained against
+`first_raiser`) measures which effect wins.
+
+
+
 ## Known pitfalls
 
 1. **`state["action_record"]` is a live list.** It is the same object as
@@ -1522,8 +1589,12 @@ Agent A hardening pass already showed.
 * **The negative result is about this game and this opponent set.** In limit
   hold'em the observation already implies most of what the action order reveals,
   and none of the three scripted opponents behaves in a way that depends on the
-  history. Whether memory helps against an opponent whose strategy *is*
-  history-dependent is untested and is the first item in the roadmap.
+  history. The first history-dependent design (`c_bettor`) was confounded because
+  it announced its mode through the pot, but the `first_raiser` probe in Stage 3
+  finds a real gap: 29.3 % of post-flop decisions sit in card-free summaries that
+  appear under both modes, and history recovers the mode there (95.6 %) while the
+  observation alone is at chance (52.7 %). The nine-run A/B/control experiment is
+  the measurement of whether that gap survives training.
 * One unexplained cell: the history arm loses about `0.20` bb/hand to the
   control against a uniform-random opponent (2 of 3 seeds resolved). Random play
   is an out-of-distribution probe, not part of the protocol, and twelve
@@ -1549,6 +1620,7 @@ Agent A hardening pass already showed.
 | 2 | Agent A: observation encoding + MLP policy trained with PPO | ✅ done and frozen — three seeds positive on a held-out style |
 | 3 | Agent B: MLP + GRU over betting history, trained with PPO | ✅ done — three seeds trained, paired against the control arm |
 | 4 | Head-to-head evaluation, ablations and results write-up | ✅ done — paired matrix and verdict above |
+| 5 | History-dependent opponent, identifiability probe and nine-run follow-up | probe done — training in progress |
 
 **Verdict: the betting-history channel does not pay for itself.** Memory of the
 opponent's actions is worth `+0.007` to `+0.020` bb/hand over a capacity-matched
@@ -1612,7 +1684,13 @@ A sensible remaining Stage 2 scope:
     over the control, no seed-level cell resolving on the three protocol
     columns, and under `0.01` bb/hand lost when a trained network's channel is
     zeroed.
-16. Only if the history question is reopened: add a scripted opponent whose
-    behaviour depends on the history (e.g. one that check-raises only after
-    being raised twice), so the token stream carries information the 131-feature
-    observation cannot. That is an environment change, not an architecture one.
+16. ~~Reopen the history question with a scripted opponent whose behaviour
+    depends on the history.~~ ✅ `FirstRaiserBettor` hides *who* opened the
+    pre-flop betting, and `scripts/history_probe.py` shows that 29.3 % of the
+    agent's post-flop decisions sit in card-free mixed groups where the
+    observation is at chance (52.7 %) and history recovers the mode (95.6 %).
+    The first attempt, `ContinuationBettor`, was rejected by the same probe as
+    confounded (0 of 4,302 mixed states).
+17. Run Agent A, Agent B and the capacity-matched control against `first_raiser`
+    for three seeds each, then rerun `scripts/compare_matrix.py` and report
+    whether memory now pays for itself. Training in progress.

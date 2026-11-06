@@ -76,6 +76,11 @@ from .rollout_b import (
     HistoryTransition,
     collect_history_trajectories,
 )
+from .opponents import (
+    ContinuationBettor,
+    FirstRaiserBettor,
+    notify_hand_start,
+)
 from .training import (
     OPPONENT_NAMES,
     Z_95,
@@ -129,9 +134,11 @@ __all__ = [
     "ActionToken",
     "AgentAPolicy",
     "AgentBPolicy",
+    "ContinuationBettor",
     "EncodedState",
     "EvaluationRecord",
     "EvaluationResult",
+    "FirstRaiserBettor",
     "HandResult",
     "HistoryEncoder",
     "HistoryPPOUpdater",
@@ -173,6 +180,7 @@ __all__ = [
     "make_opponent",
     "normalize",
     "normalize_advantages",
+    "notify_hand_start",
     "play_random_hand",
     "raising_opponent",
     "random_opponent",

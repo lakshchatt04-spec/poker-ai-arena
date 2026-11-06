@@ -37,6 +37,7 @@ from .environment import make_environment, reset_hand
 from .history import HistoryTracker
 from .networks import PolicyValueNet
 from .networks_b import HISTORY_HIDDEN, HistoryPolicyValueNet
+from .opponents import notify_hand_start
 from .ppo import PPOConfig
 from .ppo_b import HistoryPPOUpdater
 from .rollout_b import (
@@ -154,6 +155,7 @@ def play_hand(
     state, player_id = reset_hand(env)
     small_blind = small_blind_player(state)
     tracker.start_hand(state)
+    notify_hand_start(opponent, state)
 
     while not env.is_over():
         if player_id == 0:
