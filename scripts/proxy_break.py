@@ -8,7 +8,7 @@ hole cards and position.  A trunk can therefore learn a features-only proxy for
 it, and the GRU becomes redundant at decision time.
 
 This script tests that explanation without retraining.  It plays paired deals
-under two opening policies:
+under three opening policies:
 
 ``greedy``
     The agent plays its trained policy.  This reproduces the small ablation
@@ -20,10 +20,20 @@ under two opening policies:
     same deal, but it no longer depends on the agent's cards, so the features
     cannot reveal what the agent did.  Only the history channel still knows.
 
+``sampled``
+    At the agent's *first* pre-flop decision, the action is drawn from the
+    trained history policy's own action distribution, then forced identically
+    for both arms.  The sampled action is still legal and on-policy for the
+    history arm, but it is stochastic conditional on the hole cards, so a
+    card-based features-only proxy can no longer predict it reliably.  This is
+    the cleanest test of the proxy explanation: the features get no more than
+    the policy's own probability, while the history records the realised action
+    exactly.
+
 If the GRU holds real mode information that the proxy normally masks, then
-zeroing it should hurt much more under ``forced`` than under ``greedy``.  If the
-gap stays near zero, the trained network genuinely does not use memory at
-decision time.
+zeroing it should hurt more under ``forced`` or ``sampled`` than under
+``greedy``.  If the gaps stay near zero, the trained network genuinely does not
+use memory at decision time.
 
 The comparison is a within-checkpoint ablation: the same weights, the same
 deals, ``use_history`` toggled.  Both arms are off the training distribution in
@@ -57,7 +67,7 @@ from poker_arena.training import make_opponent
 from poker_arena.training_b import AgentBPolicy, load_checkpoint_b
 
 Z_95 = 1.959963984540054
-CONDITIONS = ("greedy", "forced")
+CONDITIONS = ("greedy", "forced", "sampled")
 
 #: Rank order for the simple hole-card strength score.
 RANKS = "23456789TJQKA"
@@ -111,6 +121,20 @@ def _forced_opening(state, rng: np.random.Generator) -> int:
     return min(legal)
 
 
+def _sample_opening(
+    policy: AgentBPolicy,
+    state,
+    player_id: int,
+    tracker: HistoryTracker,
+    small_blind: int,
+    rng: np.random.Generator,
+) -> int:
+    """Draw the first pre-flop action from the policy's own distribution."""
+
+    probs = policy.action_probs(state, player_id, tracker, small_blind)
+    return int(rng.choice(probs.size, p=probs))
+
+
 def _play_hand(
     env,
     policy: AgentBPolicy,
@@ -119,8 +143,16 @@ def _play_hand(
     *,
     forced: bool,
     deal_seed: int,
+    sampler=None,
+    sampled_action: int | None = None,
 ) -> tuple[float, dict[str, float]]:
-    """Play one hand as player 0, optionally randomising its opening action."""
+    """Play one hand as player 0, optionally overriding its opening action.
+
+    Exactly one of ``sampled_action``, ``sampler`` and ``forced`` should be set
+    (in that order of precedence).  ``sampled_action`` lets the caller replay the
+    action that the *history* arm sampled, so both ablation arms open the same
+    way even though only one of them can compute the sampling distribution.
+    """
 
     state, player_id = reset_hand(env)
     small_blind = small_blind_player(state)
@@ -130,6 +162,7 @@ def _play_hand(
     rng = np.random.default_rng(deal_seed * 2 + 1)
     agent_preflop_decisions = 0
     first_preflop_raiser: int | None = None
+    opening_action = -1
     opening_raise = 0.0
     greedy_raise = 0.0
     strength = 0.0
@@ -141,9 +174,24 @@ def _play_hand(
             greedy = int(policy(state, player_id, tracker, small_blind))
             action = greedy
             if street == 0 and agent_preflop_decisions == 0:
-                if forced:
+                if sampled_action is not None:
+                    action = int(sampled_action)
+                    if action not in state["legal_actions"]:
+                        raise ValueError(
+                            f"sampled opening action {action!r} is illegal; "
+                            f"legal: {sorted(state['legal_actions'])}"
+                        )
+                elif sampler is not None:
+                    action = int(sampler(state, player_id, tracker, small_blind))
+                    if action not in state["legal_actions"]:
+                        raise ValueError(
+                            f"sampler returned illegal opening action {action!r}; "
+                            f"legal: {sorted(state['legal_actions'])}"
+                        )
+                elif forced:
                     action = _forced_opening(state, rng)
                 if not recorded:
+                    opening_action = int(action)
                     opening_raise = float(env.actions[action] == "raise")
                     greedy_raise = float(env.actions[greedy] == "raise")
                     strength = _hole_strength(state["raw_obs"]["hand"])
@@ -169,6 +217,7 @@ def _play_hand(
         state, player_id = env.step(action)
 
     info = {
+        "opening_action": float(opening_action),
         "opening_raise": opening_raise,
         "greedy_raise": greedy_raise,
         "strength": strength,
@@ -186,16 +235,22 @@ def _run_condition(
     seed: int,
     opponent_name: str,
     *,
-    forced: bool,
+    condition: str,
 ) -> dict[str, np.ndarray]:
     """Paired deals; history-on minus history-zeroed, plus opening stats."""
 
+    if condition not in CONDITIONS:
+        raise ValueError(f"unknown condition {condition!r}")
+
+    forced = condition == "forced"
+    sampled = condition == "sampled"
     tracker = HistoryTracker()
     payoffs_on = np.empty(int(hands), dtype=np.float64)
     payoffs_off = np.empty(int(hands), dtype=np.float64)
     stats = {
         key: np.empty(int(hands), dtype=np.float64)
         for key in (
+            "opening_action",
             "opening_raise",
             "greedy_raise",
             "strength",
@@ -206,12 +261,19 @@ def _run_condition(
 
     for hand in range(int(hands)):
         deal_seed = int(seed) + hand
+        sample_rng = np.random.default_rng(deal_seed * 2 + 3)
+
+        def sampler(state, player_id, tracker, small_blind, *, _rng=sample_rng):
+            return _sample_opening(
+                policy_history, state, player_id, tracker, small_blind, _rng
+            )
 
         env.seed(deal_seed)
         opponent = make_opponent(opponent_name, seed=deal_seed)
         payoffs_on[hand], info = _play_hand(
             env, policy_history, opponent, tracker,
             forced=forced, deal_seed=deal_seed,
+            sampler=sampler if sampled else None,
         )
         for key, value in info.items():
             stats[key][hand] = value
@@ -221,6 +283,9 @@ def _run_condition(
         payoffs_off[hand], _ = _play_hand(
             env, policy_zeroed, opponent, tracker,
             forced=forced, deal_seed=deal_seed,
+            sampled_action=(
+                int(info["opening_action"]) if sampled else None
+            ),
         )
 
     return {
@@ -275,6 +340,13 @@ def main(argv: list[str] | None = None) -> int:
         "'forced' flips a per-hand coin for the agent's first pre-flop action, so"
     )
     lines.append("its cards no longer reveal what it did.")
+    lines.append(
+        "'sampled' draws that first action from the history policy's own"
+    )
+    lines.append(
+        "distribution, then forces the same action on both arms; the realised"
+    )
+    lines.append("action is stochastic given the cards.")
     lines.append("")
 
     all_diffs = {condition: [] for condition in CONDITIONS}
@@ -294,10 +366,9 @@ def main(argv: list[str] | None = None) -> int:
         lines.append("")
 
         for condition in CONDITIONS:
-            forced = condition == "forced"
             data = _run_condition(
                 env, policy_on, policy_off, args.hands, args.seed_base,
-                args.opponent, forced=forced,
+                args.opponent, condition=condition,
             )
             diff_mean, diff_half = _summary(data["difference"])
             on_mean, _ = _summary(data["on"])
@@ -359,15 +430,15 @@ def main(argv: list[str] | None = None) -> int:
             lines.append(f"| {condition} | n/a | 0 |")
     lines.append("")
     lines.append(
-        "Reading: if 'forced' is materially larger than 'greedy', the GRU still"
+        "Reading: if 'forced' or 'sampled' is materially larger than 'greedy',"
     )
     lines.append(
-        "carries the mode and the features-only proxy is what hides it at"
+        "the GRU still carries the mode and the features-only proxy is what hides"
     )
     lines.append(
-        "decision time. If the two are the same, the trained policy does not use"
+        "it at decision time. If all three are the same, the trained policy does"
     )
-    lines.append("memory even when the proxy is unavailable.")
+    lines.append("not use memory even when the proxy is unavailable.")
 
     report = "\n".join(lines)
     print(report)

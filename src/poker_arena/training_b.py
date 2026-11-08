@@ -94,9 +94,15 @@ class AgentBPolicy:
     encoder: ObservationEncoder
     use_history: bool = True
 
-    def __call__(
+    def logits(
         self, state: Any, player_id: int, tracker: HistoryTracker, small_blind: int
-    ) -> int:
+    ) -> np.ndarray:
+        """Raw action logits for this state, as a 1-D float64 array.
+
+        Illegal actions stay at :data:`~poker_arena.networks_b.MASKED_LOGIT`, so
+        they receive zero probability in :meth:`action_probs`.
+        """
+
         encoded = self.encoder.encode(
             state, is_small_blind=(small_blind == player_id)
         )
@@ -109,7 +115,33 @@ class AgentBPolicy:
                 torch.from_numpy(encoded.legal_mask).unsqueeze(0),
                 use_history=self.use_history,
             )
-        return int(torch.argmax(logits, dim=-1))
+        return logits.squeeze(0).numpy().astype(np.float64)
+
+    def action_probs(
+        self, state: Any, player_id: int, tracker: HistoryTracker, small_blind: int
+    ) -> np.ndarray:
+        """Softmax over the legal actions, for sampling and diagnostics.
+
+        Masked (illegal) actions have logits around ``-1e9``, so ``exp`` underflows
+        them to exactly zero; the result therefore sums to one over the legal set.
+        """
+
+        logits = self.logits(state, player_id, tracker, small_blind)
+        shifted = logits - logits.max()
+        weights = np.exp(shifted)
+        total = weights.sum()
+        if not np.isfinite(total) or total <= 0.0:
+            raise ValueError(
+                "action probabilities are not normalisable; check the legal mask"
+            )
+        return weights / total
+
+    def __call__(
+        self, state: Any, player_id: int, tracker: HistoryTracker, small_blind: int
+    ) -> int:
+        return int(
+            np.argmax(self.logits(state, player_id, tracker, small_blind))
+        )
 
 
 @dataclass(frozen=True)

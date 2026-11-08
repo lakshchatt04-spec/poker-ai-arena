@@ -455,6 +455,28 @@ def test_evaluate_policy_reports_the_same_statistics(env, encoder):
     assert result.stderr_bb > 0
 
 
+def test_action_probs_are_a_legal_distribution(env, encoder):
+    """Sampling needs a real probability vector: legal-only and normalised."""
+
+    state, player_id = env.reset()
+    small_blind = small_blind_player(state)
+    tracker = HistoryTracker()
+    tracker.start_hand(state)
+    policy = AgentBPolicy(_net(), encoder)
+
+    probs = policy.action_probs(state, player_id, tracker, small_blind)
+    legal = np.asarray(sorted(state["legal_actions"]), dtype=int)
+    illegal = np.setdiff1d(np.arange(NUM_ACTIONS), legal)
+
+    assert probs.shape == (NUM_ACTIONS,)
+    assert probs.sum() == pytest.approx(1.0)
+    assert np.all(probs[legal] > 0.0)
+    assert np.all(probs[illegal] == 0.0)
+    assert int(np.argmax(probs)) == policy(
+        state, player_id, tracker, small_blind
+    )
+
+
 def test_paired_evaluation_of_one_policy_is_exactly_zero(env, encoder):
     net = _net()
     policy = AgentBPolicy(net, encoder)

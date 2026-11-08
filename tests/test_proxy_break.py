@@ -141,3 +141,66 @@ def test_play_hand_returns_a_finite_payoff():
     assert np.isfinite(payoff)
     assert info["agent_acted_preflop"] in (0.0, 1.0)
     assert 0.0 <= info["strength"] <= 1.0
+
+
+class _DistributionPolicy:
+    """Policy stub with a fixed opening distribution."""
+
+    def __init__(self, probs):
+        self.probs = np.asarray(probs, dtype=np.float64)
+
+    def action_probs(self, state, player_id, tracker, small_blind):
+        return self.probs
+
+
+def test_sample_opening_respects_the_distribution_support():
+    policy = _DistributionPolicy([0.0, 1.0, 0.0, 0.0])
+    for seed in range(20):
+        action = proxy_break._sample_opening(
+            policy, {"legal_actions": [0, 1]}, 0, None, 0,
+            np.random.default_rng(seed),
+        )
+        assert action == 1
+
+
+def test_sampled_opening_is_identical_for_both_arms_on_the_same_deal():
+    env = make_environment(seed=10_000)
+    tracker = HistoryTracker()
+    deal_seed = 10_013
+
+    def sampler(state, player_id, tracker, small_blind):
+        return 1 if 1 in state["legal_actions"] else 0
+
+    env.seed(deal_seed)
+    opponent = make_opponent("passive", seed=deal_seed)
+    _, sampled_info = proxy_break._play_hand(
+        env, _CallPolicy(), opponent, tracker,
+        forced=False, deal_seed=deal_seed, sampler=sampler,
+    )
+
+    env.seed(deal_seed)
+    opponent = make_opponent("passive", seed=deal_seed)
+    _, replayed_info = proxy_break._play_hand(
+        env, _RaisePolicy(), opponent, tracker,
+        forced=False, deal_seed=deal_seed,
+        sampled_action=int(sampled_info["opening_action"]),
+    )
+
+    assert sampled_info["agent_acted_preflop"] == 1.0
+    assert replayed_info["agent_acted_preflop"] == 1.0
+    assert sampled_info["opening_action"] == replayed_info["opening_action"]
+    assert sampled_info["opening_raise"] == replayed_info["opening_raise"]
+
+
+def test_illegal_sampled_opening_is_rejected():
+    env = make_environment(seed=10_000)
+    tracker = HistoryTracker()
+    deal_seed = 10_021
+    env.seed(deal_seed)
+    opponent = make_opponent("passive", seed=deal_seed)
+
+    with pytest.raises(ValueError, match="illegal"):
+        proxy_break._play_hand(
+            env, _CallPolicy(), opponent, tracker,
+            forced=False, deal_seed=deal_seed, sampled_action=1_234,
+        )

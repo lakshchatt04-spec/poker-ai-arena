@@ -90,6 +90,7 @@ poker-ai-arena/
 │   ├── test_networks.py            # network tests
 │   ├── test_opponents.py           # hidden-mode collisions on real RLCard states
 │   ├── test_ppo.py                 # PPO-update tests
+│   ├── test_proxy_break.py         # sampled/forced opening invariants
 │   ├── test_rollout.py             # rollout and GAE tests
 │   └── test_training.py            # training-loop and evaluation tests
 ├── .venv/                          # local environment (git-ignored)
@@ -1673,6 +1674,138 @@ hidden-mode bot could produce. And three seeds with a `0.199` spread cannot
 resolve the three-seed mean; the per-seed paired intervals are what the verdict
 rests on.
 
+## Stage 3b: a genuinely mixed pre-flop policy
+
+Stage 3 left one loophole. The hidden mode is the agent's own first pre-flop
+raise, and the pre-registered caveat was that a deterministic card-based
+opening lets the trunk read its own cards at the flop and recover the mode
+without memory. The trained opening was indeed sharp: under greedy play the
+weakest quarter of hands raised `0.0-0.4 %` and the strongest `72.9-86.8 %`.
+Breaking that proxy only at evaluation time (`forced`) did not revive reliance,
+but it also pushed both arms off the training distribution.
+
+The training-time version of the test keeps the policy in distribution: add an
+extra entropy bonus on **pre-flop decisions only**. The rest of the PPO
+objective, including the post-flop entropy coefficient, is unchanged. This
+forces the opening to stay mixed without asking the agent to randomise its
+post-flop play, which is where most of the payoff is decided.
+
+### Implementation
+
+`encoding.preflop_rows()` selects the rows of a batch whose street one-hot is
+pre-flop. `PPOConfig.entropy_coef_preflop` adds a second entropy term over those
+rows, and `run_ppo_update` accepts per-row entropy weights so the history-aware
+and control updaters share one code path. The training CSV gains
+`entropy_preflop` and `preflop_fraction`.
+
+A 10-iteration pilot chose the coefficient `0.1`: pre-flop entropy saturates
+near its maximum while post-flop entropy still falls normally. All six runs
+(history and control, seeds 0/1/2) then trained for the usual 50 iterations
+against `first_raiser`. At iteration 50 the pre-flop entropies are
+`1.036 / 1.007 / 1.027` for history and `1.035 / 1.027 / 1.019` for control,
+against `0.47` in the Stage 3 runs; overall entropy is `0.66-0.82`.
+
+The final in-run evaluation (2,000 hands per opponent, unpaired) is:
+
+| arm | passive | raiser_strong | raiser_loose |
+|---|---|---|---|
+| B (history) | +0.226 | −0.082 | +0.400 |
+| B control | +0.108 | −0.237 | +0.137 |
+
+The paired history-minus-control matrix (2,000 identical deals per cell) is:
+
+| opponent | seed 0 | seed 1 | seed 2 | mean | resolved |
+|---|---|---|---|---|---|
+| first_raiser | +0.4502 (yes) | +0.1990 | +0.0573 | **+0.2355** | 1/3 (3/3 same sign) |
+| passive | +0.1757 (yes) | +0.0775 | −0.0333 | +0.0733 | 1/3 (2/3 same sign) |
+| raiser_strong | +0.2162 (yes) | +0.2555 (yes) | +0.0393 | +0.1703 | 2/3 (3/3 same sign) |
+| raiser_loose | +0.2243 (yes) | +0.2910 (yes) | +0.0467 | +0.1873 | 2/3 (3/3 same sign) |
+
+Against the training opponent the advantage is slightly smaller than Stage 3's
+`+0.2762` and resolves in one seed instead of two. Against the held-out raisers
+it roughly doubles (`+0.079 → +0.170` and `+0.133 → +0.187`). The intervention
+did not buy a larger `first_raiser` gain, but it broadened the benefit.
+
+### Decision-time reliance grows
+
+The within-checkpoint ablation is the test that failed in Stage 3. Same weights,
+same deals, `use_history` toggled:
+
+| opponent | seed 0 | seed 1 | seed 2 | mean | resolved |
+|---|---|---|---|---|---|
+| first_raiser | +0.0335 | +0.1000 (yes) | +0.0375 | **+0.0570** | 1/3 (3/3 same sign) |
+| passive | +0.0275 (yes) | +0.0015 | +0.0155 | +0.0148 | 1/3 (3/3 same sign) |
+| raiser_strong | +0.0015 | −0.0245 | −0.0005 | −0.0078 | 0/3 |
+| raiser_loose | −0.0085 | +0.1225 (yes) | +0.0300 | +0.0480 | 1/3 (2/3 same sign) |
+
+Zeroing the channel is now worth `+0.057` bb/hand against `first_raiser`, up
+from `−0.0065` in Stage 3, and every seed points the same way. It
+is also no longer confined to the training opponent: `raiser_loose` gains
+`+0.048` and `passive` `+0.015`. The trained network is using memory at decision
+time, not just during learning.
+
+The retained fraction is still modest: `0.057` of the `0.236` training gain,
+about a quarter. The rest remains a learning effect, as in Stage 3. But the
+sign of the Stage 3 conclusion has changed: memory is no longer only a scaffold.
+
+### Sampling the opening instead of forcing it
+
+`scripts/proxy_break.py` gained a third condition. At the agent's first
+pre-flop decision, `sampled` draws the action from the trained history policy's
+own distribution and forces that same action on both ablation arms. The realised
+action is legal and on-policy for the history arm, but it is stochastic
+conditional on the hole cards, so a card-based features-only proxy cannot know
+which action happened. Unlike `forced`, this stays close to the training
+distribution.
+
+The sampled opening really is mixed. The opening raise rate is `26.5-29.9 %` in
+the weakest quarter of hole-card strength and `48.3-54.7 %` in the strongest,
+against `0.0-9.5 %` / `84.3-95.3 %` under greedy play.
+
+History-on minus history-zeroed, 2,000 paired deals per cell:
+
+| condition | seed 0 | seed 1 | seed 2 | mean | resolved |
+|---|---|---|---|---|---|
+| greedy | +0.0335 | +0.1000 (yes) | +0.0375 | +0.0570 | 1/3 |
+| forced opening | +0.0185 | +0.0530 (yes) | +0.0415 | +0.0377 | 1/3 |
+| sampled opening | +0.0285 | +0.0740 (yes) | +0.0675 (yes) | **+0.0567** | 2/3 |
+
+The greedy row reproduces the matrix ablation exactly (`+0.0570`), validating
+the harness. The sampled row is the same size as greedy. That is the key
+result: once the pre-flop policy is genuinely mixed, removing the card-based
+proxy at evaluation time does **not** increase reliance, because the channel was
+already being used. Under the Stage 3 policy, breaking the proxy left reliance
+at zero; here it leaves an already-positive reliance unchanged.
+
+The probe also quantifies why the intervention worked. Under greedy play, the
+opening raise rate is `0.0-9.5 %` in the weakest quarter and `84.3-95.3 %` in
+the strongest: cards nearly determine the action. When the opening is sampled
+from the trained network, the same quarter rates are `26.5-29.9 %` /
+`48.3-54.7 %`, so the realised action is no longer a one-to-one function of
+hand strength. The trunk has to read the actual action sequence to know its own
+past.
+
+### Verdict for Stage 3b
+
+**A genuinely mixed pre-flop policy makes memory decision-relevant.**
+
+1. Training-time benefit survives (`+0.236` bb/hand over the control against
+   `first_raiser`, 3/3 seeds positive) and grows on the held-out raisers
+   (`+0.170`, `+0.187`).
+2. Decision-time reliance rises roughly tenfold, to `+0.057` bb/hand
+   (`3/3` seeds positive, one resolved), against `−0.007` in Stage 3.
+3. Sampling the opening does not raise reliance above the greedy level
+   (`+0.0567` vs `+0.0570`), so the gain is not a proxy artefact: the network
+   uses the action channel itself.
+4. About a quarter of the training benefit is retained at decision time. The
+   rest is still a learning effect.
+
+The caveat is that `sampled` is a softer break than `forced`: the action
+probabilities still depend on the cards, just not one-to-one. `forced` also
+turns positive (`+0.0377`) under the mixed policy, though only one of three
+seeds resolves. Three seeds remain the limiting resource; the per-seed
+intervals, not the three-seed means, carry the claim.
+
 ## Known pitfalls
 
 1. **`state["action_record"]` is a live list.** It is the same object as
@@ -1734,22 +1867,22 @@ rests on.
 * The encoder, the policy/value network, the rollout buffer, the PPO update and
   the training loop all exist. Agent B's network, rollout, PPO updater, training
   loop, checkpointing, paired comparison and history-reliance diagnostic are
-  implemented, tested and exercised on fifteen runs (the six original runs plus
-  the nine Stage 3 runs).
+  implemented, tested and exercised on twenty-one runs (the six original runs,
+  the nine Stage 3 runs and the six pre-flop-entropy runs).
 * Agent B's comparison is confounded slightly by capacity: B has `+15.9 %` more
   parameters than A. The control arm (same capacity, no history input) removes
   that confound for the "memory vs no memory" question, but the headline A-vs-B
   number cannot separate memory from the wider heads. The verdict rests on the
   control arm and the ablation, not on the A-vs-B columns.
-* **The Stage 3 benefit is a training-time effect, not retained memory.** The
-  history arm beats the control by `+0.276` bb/hand on the training opponent,
-  but zeroing the GRU in the trained network is worth about `0` and the policy
-  changes about 1 % of decisions when it is removed. Breaking the card-based
-  proxy at evaluation time (`scripts/proxy_break.py`: random opening action)
-  does not revive reliance either (`+0.0035` bb/hand, 1/6 cells resolved), so
-  this is not merely redundancy masking a usable signal. The iteration-20
-  reliance peak is consistent with a scaffold that the trunk later absorbs, but
-  that mechanism is inferred, not proven.
+* **Stage 3's decision-time conclusion depends on the pre-flop policy.** With a
+  sharp card-based opening, the history arm beats the control by `+0.276`
+  bb/hand but zeroing the GRU is worth about `0`, and breaking the proxy at
+  evaluation time does not revive reliance (`+0.0035`, 1/6 cells). With a
+  genuinely mixed opening (`entropy_coef_preflop = 0.1`), the training gain is
+  `+0.236`, the ablation rises to `+0.057` (3/3 seeds positive), and sampling
+  the opening leaves it unchanged (`+0.0567`). About a quarter of the training
+  benefit is now retained at decision time. The mechanism -- a scaffold that
+  the trunk partly absorbs -- is still inferred, not proven.
 * **The hidden-mode opponent is imperfect.** `FirstRaiserBettor` can misclassify
   itself as the first raiser when it re-raises after the agent opened, so its
   intended post-flop mode is not always realized (`70.7 %` bet rate in mode 1).
@@ -1779,39 +1912,42 @@ rests on.
 | 2 | Agent A: observation encoding + MLP policy trained with PPO | ✅ done and frozen — three seeds positive on a held-out style |
 | 3 | Agent B: MLP + GRU over betting history, trained with PPO | ✅ done — three seeds trained, paired against the control arm |
 | 4 | Head-to-head evaluation, ablations and results write-up | ✅ done — paired matrix and verdict above |
-| 5 | History-dependent opponent, identifiability probe and nine-run follow-up | ✅ done — memory helps training (`+0.276` bb/hand vs control) but not final decisions |
+| 5 | History-dependent opponent, identifiability probe and nine-run follow-up | ✅ done — memory helps training (`+0.276` bb/hand vs control); final policy relies on the card proxy |
+| 6 | Mixed pre-flop retrain, sampled-opening probe and decision-time ablation | ✅ done — reliance grows to `+0.057` bb/hand; about a quarter of the training gain retained |
 
-**Verdict: memory pays during training, not at decision time.** Against the
-original memoryless opponents it was worth nothing and the sign flipped across
-seeds. Against an opponent whose post-flop play depends on who opened the
-pre-flop betting, training with the channel is worth `+0.276` bb/hand over a
-capacity-matched control (3/3 seeds positive, 2/3 resolved) and is positive on
-all three held-out opponents. But zeroing the trained channel costs `0.007`
-bb/hand and changes about 1 % of decisions: the final policy has distilled the
-hidden variable into a features-only proxy. The pre-registered caveat -- the
-hidden fact is the agent's own pre-flop raise -- is the most likely reason.
+**Verdict: memory is a training-time scaffold that becomes a decision-time input
+when the opening is genuinely mixed.** Against the original memoryless
+opponents it was worth nothing and the sign flipped across seeds. Against
+`first_raiser` with a sharp card-based opening, training with the channel was
+worth `+0.276` bb/hand over the capacity-matched control, but zeroing the
+trained channel cost `0.007`: the trunk had distilled the hidden variable into a
+features-only proxy. Adding a pre-flop-only entropy bonus (`0.1`) makes the
+opening genuinely mixed. The training gain is similar (`+0.236`), the ablation
+rises to `+0.057` (3/3 seeds positive, one resolved), and a sampled-opening
+probe -- which removes the card proxy without leaving the policy's own
+distribution -- gives the same `+0.057`. So the channel is now used, not merely
+learned through. About a quarter of the training benefit is retained at
+decision time; three seeds and a soft sampled break bound the claim.
 
-**Recommended next milestone: remove the proxy during training.** The remaining
-question is whether memory can be made *decision-relevant* rather than a
-learning aid. The first diagnostic is done: the trained policy's opening action
-is a sharp function of hole-card strength (raise rate `0.0-0.4 %` in the weakest
-quarter, `72.9-86.8 %` in the strongest), so the mode is recoverable without
-memory. Forcing a random opening action removes that proxy, but zeroing the GRU
-is then still worth only `+0.0035` bb/hand (1/6 cells resolved), so the benefit
-is not merely hidden by redundancy.
+**Recommended next milestone: make the hidden fact independent of the agent's
+own policy.** Every opponent so far keys on something the agent controls (its
+own action) or on public chips and raise counts. The current design is the
+cleanest collision found, but the hidden mode is still the agent's own first
+raise, which is why a sharp policy can learn around it. A cleaner test is an
+opponent whose hidden style is a **per-hand coin independent of the agent**,
+revealed only through the opponent's own actions: for example, a bot that bets
+the flop when the coin is heads and checks when it is tails, then plays a
+different turn/river strategy in the two modes. The agent's later decisions can
+use the remembered opponent action; the control arm cannot, because the
+131-feature observation does not encode the opponent's action sequence. The
+identifiability probe should be rerun before training. The first decision that
+faces the opponent's first action is genuinely ambiguous for both arms, so the
+claim would be about later-street memory, not about the first response.
 
-The remaining experiment is to retrain the history and control arms with a
-genuinely mixed pre-flop policy (a higher entropy coefficient, or entropy applied
-to pre-flop decisions only) so that the agent cannot reconstruct its own past
-action from its cards even at convergence. If memory is decision-relevant, the
-within-checkpoint ablation should grow; if it stays at zero, the channel is not
-worth its parameters at this scale.
-
-A stronger environment change would hide a fact that is *not* the agent's own
-action, but that is hard in heads-up limit hold'em: the observation already
-contains the chips and raise counts, so almost any opponent pattern is visible
-once it has acted. The current `first_raiser` design is the cleanest collision
-found so far, and its limitation is now measured rather than assumed.
+If that redesign is not worth the compute, the cheaper follow-up is more seeds
+on the mixed-pre-flop protocol. The ablation's per-seed spread is `sd 0.037` and
+only one of three seeds resolves; at `+0.057` bb/hand the effect is now large
+enough that a five-seed run would settle the mean.
 
 A sensible remaining Stage 2 scope:
 
