@@ -85,6 +85,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="where the .pt files live",
     )
     parser.add_argument(
+        "--history-prefix", default="agent_b",
+        help="run-name prefix of the history arm (default: agent_b)",
+    )
+    parser.add_argument(
+        "--control-prefix", default="agent_b_control",
+        help="run-name prefix of the control arm (default: agent_b_control)",
+    )
+    parser.add_argument(
         "--seed-base", type=int, default=10_000,
         help="base deal seed; hand h uses seed + h (default: 10000)",
     )
@@ -99,20 +107,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _checkpoint_paths(mode: str, seed: int, directory: Path) -> tuple[Path, Path]:
+def _checkpoint_paths(
+    mode: str,
+    seed: int,
+    directory: Path,
+    *,
+    history_prefix: str = "agent_b",
+    control_prefix: str = "agent_b_control",
+) -> tuple[Path, Path]:
+    history = directory / f"{history_prefix}_seed{seed}_0050.pt"
     if mode == "history-vs-control":
-        return (
-            directory / f"agent_b_seed{seed}_0050.pt",
-            directory / f"agent_b_control_seed{seed}_0050.pt",
-        )
+        return history, directory / f"{control_prefix}_seed{seed}_0050.pt"
     if mode == "agent-a-vs-b":
-        return (
-            directory / f"agent_a_seed{seed}_0050.pt",
-            directory / f"agent_b_seed{seed}_0050.pt",
-        )
+        return directory / f"agent_a_seed{seed}_0050.pt", history
     if mode == "ablation":
-        path = directory / f"agent_b_seed{seed}_0050.pt"
-        return path, path
+        return history, history
     raise ValueError(f"unknown mode {mode!r}")
 
 
@@ -173,7 +182,11 @@ def main(argv: list[str] | None = None) -> int:
         for opponent in args.opponents:
             seed_means: list[float] = []
             for seed in args.seeds:
-                first, second = _checkpoint_paths(mode, seed, directory)
+                first, second = _checkpoint_paths(
+                    mode, seed, directory,
+                    history_prefix=args.history_prefix,
+                    control_prefix=args.control_prefix,
+                )
                 built = _policies(mode, first, second, encoder)
                 if built is None:
                     lines.append(

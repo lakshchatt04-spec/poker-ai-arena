@@ -14,6 +14,7 @@ import pytest
 from poker_arena.encoding import ObservationEncoder, small_blind_player
 from poker_arena.environment import make_environment, reset_hand
 from poker_arena.opponents import (
+    CoinOpenerBettor,
     ContinuationBettor,
     FirstRaiserBettor,
     notify_hand_start,
@@ -210,6 +211,120 @@ def test_make_opponent_knows_the_first_raiser_name():
     assert "first_raiser" in OPPONENT_NAMES
     opponent = make_opponent("first_raiser", seed=5)
     assert isinstance(opponent, FirstRaiserBettor)
+
+
+def test_coin_opener_draws_a_coin_at_hand_start():
+    aggressive = CoinOpenerBettor(seed=0, raise_probability=1.0)
+    aggressive.start_hand(_preflop_state())
+    assert aggressive.coin is True
+
+    passive = CoinOpenerBettor(seed=0, raise_probability=0.0)
+    passive.start_hand(_preflop_state())
+    assert passive.coin is False
+
+
+def test_coin_opener_coin_is_independent_of_the_cards():
+    """Two bots with the same seed must agree across different dealt hands."""
+
+    first = CoinOpenerBettor(seed=17, raise_probability=0.5)
+    second = CoinOpenerBettor(seed=17, raise_probability=0.5)
+    states = [
+        _preflop_state(),
+        {"legal_actions": {0, 1, 2}, "raw_obs": {"public_cards": [], "hand": ["SA", "HA"]}},
+        {"legal_actions": {0, 1, 2}, "raw_obs": {"public_cards": [], "hand": ["S2", "H3"]}},
+    ]
+    for state in states:
+        first.start_hand(state)
+        second.start_hand(state)
+        assert first.coin == second.coin
+
+
+def test_coin_opener_heads_raises_preflop_and_checks_postflop():
+    bot = CoinOpenerBettor(seed=0, raise_probability=1.0)
+    bot.start_hand(_preflop_state())
+    assert bot(_preflop_state(), 1) == 1
+    assert bot(_flop_state(), 1) in (0, 3)
+
+
+def test_coin_opener_tails_calls_preflop_and_bets_postflop():
+    bot = CoinOpenerBettor(seed=0, raise_probability=0.0)
+    bot.start_hand(_preflop_state())
+    assert bot(_preflop_state(), 1) in (0, 2, 3)
+    assert bot(_flop_state(), 1) == 1
+
+
+def test_coin_opener_does_not_re_roll_preflop():
+    bot = CoinOpenerBettor(seed=0, raise_probability=1.0)
+    bot.start_hand(_preflop_state())
+    assert bot(_preflop_state(), 1) == 1
+    # A second pre-flop decision must call rather than raise again.
+    assert bot(_preflop_state(), 1) != 1
+    assert bot.coin is True
+
+
+def test_make_opponent_knows_the_coin_opener_name():
+    assert "coin_opener" in OPPONENT_NAMES
+    opponent = make_opponent("coin_opener", seed=5)
+    assert isinstance(opponent, CoinOpenerBettor)
+
+
+def _play_to_agent_flop_decision_with_coin(engine_seed: int, *, coin: bool):
+    """Reach the big blind's first flop decision with the bot on the small blind.
+
+    The agent plays the complementary pre-flop response: call a bot raise, raise
+    a bot call, then call any later pre-flop bet.  Both coin values therefore
+    reach the flop with the same chips and raise count.
+    """
+
+    env = make_environment(seed=engine_seed)
+    encoder = ObservationEncoder.from_environment(env)
+    state, player_id = reset_hand(env)
+    assert small_blind_player(state) == 1, "these seeds must put the small blind on player 1"
+
+    bot = CoinOpenerBettor(
+        seed=engine_seed,
+        raise_probability=1.0 if coin else 0.0,
+    )
+    notify_hand_start(bot, state)
+
+    agent_preflop_decisions = 0
+    while not env.is_over():
+        flop_dealt = bool(state["raw_obs"]["public_cards"])
+        if player_id == 0 and flop_dealt:
+            break
+        if player_id == 0:
+            action = (0 if coin else 1) if agent_preflop_decisions == 0 else 0
+            agent_preflop_decisions += 1
+        else:
+            action = int(bot(state, player_id))
+        state, player_id = env.step(action)
+
+    features = encoder.encode(state, is_small_blind=False).features
+    return state, features, bot
+
+
+@pytest.mark.parametrize("engine_seed", [1, 4, 7, 9, 12, 13, 18, 20, 21, 22])
+def test_coin_opener_hides_the_coin_at_the_agents_flop_decision(engine_seed):
+    """Both coin values reach the flop with identical features.
+
+    Aggressive coin: bot raises, agent calls.  Passive coin: bot calls, agent
+    raises, bot calls.  Chips and raise counts match; only the action record
+    distinguishes the two modes.
+    """
+
+    aggressive = _play_to_agent_flop_decision_with_coin(engine_seed, coin=True)
+    passive = _play_to_agent_flop_decision_with_coin(engine_seed, coin=False)
+
+    state_a, features_a, bot_a = aggressive
+    state_b, features_b, bot_b = passive
+
+    assert bot_a.coin is True
+    assert bot_b.coin is False
+    assert state_a["raw_obs"]["all_chips"] == state_b["raw_obs"]["all_chips"]
+    assert state_a["raw_obs"]["raise_nums"] == state_b["raw_obs"]["raise_nums"]
+    assert state_a["raw_obs"]["public_cards"] == state_b["raw_obs"]["public_cards"]
+    np.testing.assert_array_equal(features_a, features_b)
+    assert state_a["action_record"] != state_b["action_record"]
 
 
 def _play_to_agent_flop_decision(engine_seed: int, *, bot_raises_preflop: bool):

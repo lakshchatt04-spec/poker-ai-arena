@@ -38,6 +38,15 @@ approximate it with a deterministic card-based pre-flop policy; the GRU should
 help most when that policy is genuinely mixed.  The nine-run experiment in the
 README measures which effect wins.
 
+``CoinOpenerBettor`` removes the "agent caused it" caveat.  A per-hand coin,
+drawn from the opponent's own RNG, selects which street the bot is aggressive
+on: heads raises pre-flop and plays passive post-flop, tails calls pre-flop and
+betting post-flop.  The coin is independent of the agent's cards and actions.
+When the agent uses the complementary pre-flop response (call a bot raise,
+raise a bot call), both coin values reach the flop with the same public
+features, so only the action record reveals the coin.  The identifiability
+probe in ``scripts/history_probe.py`` tests the collision before training.
+
 ``tests/test_opponents.py`` asserts both collisions on real environment states
 rather than trusting this comment.
 """
@@ -121,6 +130,76 @@ class ContinuationBettor:
             return _call_check_fold(legal)
 
         if self._aggressor and 1 in legal:
+            return 1
+        return _call_check_fold(legal)
+
+
+class CoinOpenerBettor:
+    """A per-hand private coin selects which street the bot is aggressive on.
+
+    The coin is drawn at the start of the hand from the opponent's own RNG, so it
+    is independent of the agent's cards and of the agent's actions.  It controls
+    the pre-flop opening: heads raises, tails calls/checks.  Post-flop the line is
+    the *opposite*: the bot bets or raises when the coin was tails, and calls or
+    checks when the coin was heads.  That inversion is what makes the two coin
+    values collide at the agent's first flop decision.
+
+    The collision needs the agent's complementary pre-flop response: call when
+    the bot raises, raise when the bot calls.  Then both lines reach the big
+    blind's first flop decision with the same board, chips and raise counts, and
+    the bot's first flop action happens *after* that decision (a check when it
+    opened, or the agent acts first when the agent opened).  Only the action
+    record reveals the coin.  Without the complementary response the coin leaks
+    through the chips, which is exactly what the identifiability probe checks.
+
+    Args:
+        seed: Seeds the per-hand coin.  A fresh instance with the same seed makes
+            the same sequence of coin flips, which paired evaluation needs.
+        raise_probability: Chance that the coin is heads (bot raises pre-flop and
+            plays passive post-flop).
+    """
+
+    def __init__(
+        self,
+        seed: int = 0,
+        raise_probability: float = PREFLOP_RAISE_PROBABILITY,
+    ) -> None:
+        if not 0.0 <= float(raise_probability) <= 1.0:
+            raise ValueError(
+                f"raise_probability must be in [0, 1], got {raise_probability!r}"
+            )
+        self._rng = np.random.default_rng(seed)
+        self.raise_probability = float(raise_probability)
+        self._coin: bool | None = None
+        self._preflop_decisions = 0
+
+    @property
+    def coin(self) -> bool | None:
+        """The current hand's coin, or ``None`` before ``start_hand``.
+
+        ``True`` means the bot raised pre-flop (and will play passive post-flop);
+        ``False`` means it called pre-flop (and will bet post-flop).
+        """
+
+        return self._coin
+
+    def start_hand(self, state: Mapping[str, Any]) -> None:
+        """Draw this hand's coin and clear the pre-flop decision count."""
+
+        self._coin = bool(self._rng.random() < self.raise_probability)
+        self._preflop_decisions = 0
+
+    def __call__(self, state: Mapping[str, Any], player_id: int) -> int:
+        legal = state["legal_actions"]
+
+        if _is_preflop(state):
+            first_decision = self._preflop_decisions == 0
+            self._preflop_decisions += 1
+            if first_decision and self._coin and 1 in legal:
+                return 1
+            return _call_check_fold(legal)
+
+        if not self._coin and 1 in legal:
             return 1
         return _call_check_fold(legal)
 

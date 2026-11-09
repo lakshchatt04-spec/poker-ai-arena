@@ -173,6 +173,7 @@ def test_make_opponent_rejects_an_unknown_name():
         "random",
         "c_bettor",
         "first_raiser",
+        "coin_opener",
     }
 
 

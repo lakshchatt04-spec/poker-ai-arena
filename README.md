@@ -1806,6 +1806,88 @@ turns positive (`+0.0377`) under the mixed policy, though only one of three
 seeds resolves. Three seeds remain the limiting resource; the per-seed
 intervals, not the three-seed means, carry the claim.
 
+## Stage 3c: a private coin
+
+Every hidden mode so far was ultimately something the agent did. `first_raiser`
+keys on the agent's own first pre-flop raise, so a sharp card-based opening lets
+the trunk infer the mode from its cards without reading the action channel.
+Stage 3b keeps that opening mixed, but the hidden fact is still the agent's
+action, not the opponent's.
+
+`CoinOpenerBettor` (`coin_opener`) removes that dependency. It draws a coin at
+`start_hand` from its **own RNG**, independently of the agent's cards and of the
+agent's actions. Heads (mode 1) raises pre-flop and plays passive post-flop;
+tails (mode 0) calls pre-flop and bets post-flop. The post-flop inversion is
+what makes the two lines collide. With the bot on the small blind and the agent
+on the big blind:
+
+* coin 1: bot raises, agent calls, bot checks the flop;
+* coin 0: bot calls, agent raises, bot calls, agent checks the flop, bot bets.
+
+Both reach the agent's first flop decision with the same board, chips (`[4, 4]`)
+and raise counts (`[1, 0, 0, 0]`). The action record is the only place the coin
+appears. The collision is asserted at ten seeds in `tests/test_opponents.py`.
+
+The agent's **complementary pre-flop response** -- call a bot raise, raise a bot
+call -- is what makes the public states coincide. If the agent opens both lines
+itself, the chips differ and the coin is public. This is a protocol fact, not a
+property of the agent's policy: the hidden coin stays independent of the agent,
+unlike Stage 3.
+
+### Probe: the coin is invisible, the action record is not
+
+`scripts/history_probe.py` gained a `coin_opener` mode and a `complement` agent.
+On 3,000 deals (seed 20,000):
+
+| measurement | result |
+|---|---|
+| post-flop decision states | 10,495 |
+| decisions in mixed betting-summary groups | 1,502 (14.3 %) |
+| first flop decisions in mixed groups | 1,502 / 3,000 (50.1 %) |
+| complementary pre-flop responses | 100.0 % of 1,502 bot-opened hands |
+| majority baseline, held-out hands | 56.9 % |
+| features only, all states | 92.9 % |
+| history tokens only, all states | 100.0 % |
+| features + history, all states | 100.0 % |
+| features only, mixed groups (n = 374) | 50.5 % |
+| cards only, mixed groups | 50.8 % |
+| mixed-group majority | 50.8 % |
+| mode 0 / mode 1 first flop bet-or-raise | 100.0 % / 0.0 % |
+
+Every ambiguous state is a first flop decision, and on this probe every
+bot-small-blind hand is ambiguous; once the bot has acted post-flop, later
+streets are always determined. On the mixed groups the cards are at chance and
+the action tokens recover the coin perfectly.
+
+### The mixed-group accuracy needs a baseline
+
+An earlier version of the probe reported 59-60 % features-only accuracy on the
+mixed groups of a uniform-random run, which looked like a leak. It was a
+reporting artifact. The classifier is fitted on **all** states, so it learns each
+summary's label imbalance from the non-card features; on a shared summary it can
+only return that constant, and the constant scores the group's majority. Two
+references settle it. On two 10,000-hand seeds (20,000 and 30,000):
+
+| measurement | seed 20,000 | seed 30,000 |
+|---|---|---|
+| features only, mixed groups | 59.4 % | 60.0 % |
+| mixed-group majority | 58.9 % | 60.6 % |
+| cards only, mixed groups | 58.6 % | 59.2 % |
+
+Cards alone sit at the group baseline, so no card information leaks. The report
+now prints both references permanently; the `complement` run has features
+50.5 % against a 50.8 % baseline.
+
+### The trained policy keeps the collision
+
+A collision that only a scripted agent can reach would not support a training
+experiment. Playing the Stage 3b checkpoint greedily against `coin_opener` for
+1,000 deals, **53.6 %** of the agent's first flop decisions are still in mixed
+groups and **56.0 %** of bot-opened hands use the complementary response. The
+policy's own mixed opening (Stage 3b) supplies the collision naturally, so the
+training run does not script the agent's pre-flop action. The probe can now load
+a checkpoint with `--agent checkpoint --checkpoint PATH`.
+
 ## Known pitfalls
 
 1. **`state["action_record"]` is a live list.** It is the same object as
@@ -1887,6 +1969,14 @@ intervals, not the three-seed means, carry the claim.
   itself as the first raiser when it re-raises after the agent opened, so its
   intended post-flop mode is not always realized (`70.7 %` bet rate in mode 1).
   This attenuates the measured training advantage and makes it a lower bound.
+* **The private-coin collision needs a complementary pre-flop response.**
+  `CoinOpenerBettor`'s coin is independent of the agent, but the ambiguous flop
+  state only occurs when the agent calls a bot raise and raises a bot call. A
+  policy that opens both lines itself reveals the coin through the chips. The
+  probe measures the realised rate on the trained policy rather than assuming
+  it: `53.6 %` of first flop decisions and `56.0 %` of bot-opened hands at the
+  Stage 3b checkpoint. The coin-opener training result is therefore conditional
+  on the policy continuing to use a mixed, partly complementary opening.
 * One unexplained cell: the history arm loses about `0.20` bb/hand to the
   control against a uniform-random opponent (2 of 3 seeds resolved). Random play
   is an out-of-distribution probe, not part of the protocol, and twelve
@@ -1914,6 +2004,7 @@ intervals, not the three-seed means, carry the claim.
 | 4 | Head-to-head evaluation, ablations and results write-up | ✅ done — paired matrix and verdict above |
 | 5 | History-dependent opponent, identifiability probe and nine-run follow-up | ✅ done — memory helps training (`+0.276` bb/hand vs control); final policy relies on the card proxy |
 | 6 | Mixed pre-flop retrain, sampled-opening probe and decision-time ablation | ✅ done — reliance grows to `+0.057` bb/hand; about a quarter of the training gain retained |
+| 7 | Private-coin opponent, identifiability probe and reporting baseline | ✅ done — coin independent of the agent; 50.1 % of first flop decisions ambiguous, history 100 %, cards at chance |
 
 **Verdict: memory is a training-time scaffold that becomes a decision-time input
 when the opening is genuinely mixed.** Against the original memoryless
@@ -1929,20 +2020,16 @@ distribution -- gives the same `+0.057`. So the channel is now used, not merely
 learned through. About a quarter of the training benefit is retained at
 decision time; three seeds and a soft sampled break bound the claim.
 
-**Recommended next milestone: make the hidden fact independent of the agent's
-own policy.** Every opponent so far keys on something the agent controls (its
-own action) or on public chips and raise counts. The current design is the
-cleanest collision found, but the hidden mode is still the agent's own first
-raise, which is why a sharp policy can learn around it. A cleaner test is an
-opponent whose hidden style is a **per-hand coin independent of the agent**,
-revealed only through the opponent's own actions: for example, a bot that bets
-the flop when the coin is heads and checks when it is tails, then plays a
-different turn/river strategy in the two modes. The agent's later decisions can
-use the remembered opponent action; the control arm cannot, because the
-131-feature observation does not encode the opponent's action sequence. The
-identifiability probe should be rerun before training. The first decision that
-faces the opponent's first action is genuinely ambiguous for both arms, so the
-claim would be about later-street memory, not about the first response.
+**Recommended next milestone: train against the private coin.** Stage 3c
+supplies the opponent and the probe, and the Stage 3b policy shows the collision
+survives a trained opening (`53.6 %` of first flop decisions ambiguous). The
+remaining work is the usual history-vs-control matrix against `coin_opener`,
+followed by the within-checkpoint ablation and a probe of the *final* policy's
+collision coverage. The coin is independent of the agent, so a positive ablation
+would be the cleanest memory result the project could report: the only way to
+know the opponent's post-flop plan is to remember who raised pre-flop. The main
+risk is that training moves the policy to an opening that reveals the coin; the
+checkpoint probe measures that directly.
 
 If that redesign is not worth the compute, the cheaper follow-up is more seeds
 on the mixed-pre-flop protocol. The ablation's per-seed spread is `sd 0.037` and
@@ -2014,6 +2101,10 @@ A sensible remaining Stage 2 scope:
     proxy is real. Forcing a random opening action breaks it, but the ablation
     is still `+0.0035` bb/hand (1/6 cells resolved): the trained network does not
     use memory even when the proxy is unavailable. `scripts/proxy_break.py`.
-19. Retrain the history and control arms with a genuinely mixed pre-flop policy
-    so the agent cannot reconstruct its own past action from its cards at all.
-    Next.
+19. ~~Retrain the history and control arms with a genuinely mixed pre-flop policy
+    so the agent cannot reconstruct its own past action from its cards at all.~~
+    ✅ Six runs with `entropy_coef_preflop = 0.1`; ablation rises to `+0.057`
+    bb/hand and the sampled-opening probe reproduces it.
+20. Train the history and control arms against `coin_opener`, then run the
+    paired matrix, the ablation and a checkpoint probe. The coin is independent
+    of the agent, so the ablation is the clean memory test. Next.

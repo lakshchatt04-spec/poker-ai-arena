@@ -50,6 +50,7 @@ from .encoding import ObservationEncoder, small_blind_player
 from .environment import make_environment, reset_hand
 from .networks import PolicyValueNet
 from .opponents import (
+    CoinOpenerBettor,
     ContinuationBettor,
     FirstRaiserBettor,
     notify_hand_start,
@@ -93,11 +94,11 @@ STRONG_HOLE_SCORE = 0.85
 LOOSE_RAISE_PROBABILITY = 0.35
 
 #: Every scripted opponent that training and evaluation can ask for.  ``random``
-#: is the uniform legal-action bot, kept as a baseline.  ``c_bettor`` and
-#: ``first_raiser`` keep per-hand state, so their post-flop play depends on the
-#: action sequence rather than only on the current state (see
-#: ``poker_arena.opponents``).  Only ``first_raiser`` was found by the
-#: identifiability probe to hide its mode from the 131-feature observation.
+#: is the uniform legal-action bot, kept as a baseline.  ``c_bettor``,
+#: ``first_raiser`` and ``coin_opener`` keep per-hand state, so their post-flop
+#: play depends on the action sequence rather than only on the current state (see
+#: ``poker_arena.opponents``).  ``first_raiser`` and ``coin_opener`` are the two
+#: designs the identifiability probe tests for a genuinely hidden mode.
 OPPONENT_NAMES = (
     "passive",
     "raiser_strong",
@@ -105,6 +106,7 @@ OPPONENT_NAMES = (
     "random",
     "c_bettor",
     "first_raiser",
+    "coin_opener",
 )
 
 
@@ -175,6 +177,8 @@ def make_opponent(name: str, seed: int = 0) -> Opponent:
         return ContinuationBettor(seed=seed)
     if name == "first_raiser":
         return FirstRaiserBettor(seed=seed)
+    if name == "coin_opener":
+        return CoinOpenerBettor(seed=seed)
     raise ValueError(
         f"unknown opponent {name!r}; choose one of {', '.join(OPPONENT_NAMES)}"
     )
