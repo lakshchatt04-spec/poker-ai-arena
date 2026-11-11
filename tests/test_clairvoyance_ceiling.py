@@ -262,6 +262,7 @@ def test_fork_restores_the_observation_and_the_raise_block():
         steps=steps, small_blind=small_blind,
     )
     action = snapshot.legal_actions[0]
+    fork_raise_nums = state["raw_obs"]["raise_nums"]
     next_state, next_player = env.step(action)
     cc.play_out(env, policy, opponent, tracker, next_state, next_player, small_blind)
     restored = cc.restore(env, snapshot)
@@ -272,6 +273,44 @@ def test_fork_restores_the_observation_and_the_raise_block():
     assert tuple(env.game.history_raise_nums) == snapshot.raise_nums
     assert len(env.action_recorder) == snapshot.action_recorder_length
     assert len(env.game.history) == snapshot.steps
+    # ``raw_obs["raise_nums"]`` aliases the game's live list.  The restore must
+    # repair that list in place, otherwise the captured fork state keeps the
+    # post-playout counts and a replay records a different history token.
+    assert tuple(fork_raise_nums) == snapshot.raise_nums
+    assert fork_raise_nums is env.game.history_raise_nums
+
+
+def test_replaying_a_fork_twice_gives_the_same_values():
+    """Other playouts must not perturb the fork the next replay starts from.
+
+    The restored fork keeps aliases into the game (``raw_obs["raise_nums"]`` is
+    the live raise-count list).  If a restore rebinds rather than repairs those
+    lists, the second replay records different history tokens and silently
+    plays a different hand -- which is exactly what this test catches.
+    """
+
+    env = make_environment(seed=10_000, allow_step_back=True)
+    policy = _ComplementPolicy()
+    tracker = HistoryTracker()
+    deal_seed = 10_000
+    opponent = cc.make_opponent("coin_opener", seed=deal_seed)
+
+    fork = cc.play_to_first_flop(env, policy, opponent, tracker, deal_seed)
+    assert fork is not None
+    state, _, small_blind, steps = fork
+    snapshot = cc.make_snapshot(
+        env, state, tracker,
+        hand=0, deal_seed=deal_seed, coin=int(opponent.coin),
+        steps=steps, small_blind=small_blind,
+    )
+    runouts = cc.sample_runouts(snapshot, 2, np.random.default_rng(0))
+
+    first = cc.evaluate_fork(env, policy, opponent, snapshot, state, runouts)
+    second = cc.evaluate_fork(env, policy, opponent, snapshot, state, runouts)
+
+    assert first.q_natural == pytest.approx(second.q_natural)
+    assert first.q_in_sample == pytest.approx(second.q_in_sample)
+    assert first.actual_action == second.actual_action
 
 
 def test_natural_replay_reproduces_the_actual_hand_payoff():

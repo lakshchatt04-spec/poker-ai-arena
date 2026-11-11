@@ -2035,7 +2035,11 @@ memory.
 7. **`raw_obs["raise_nums"]` is a live list**, the same object RLCard keeps as
    `history_raise_nums`. It keeps changing after the decision, so copy it
    (`list(...)`) before storing it. `HistoryTracker` reads it immediately, so
-   tokens always carry the count that was true at decision time.
+   tokens always carry the count that was true at decision time. The same alias
+   bites any step-back restore: **repair the list in place**
+   (`history_raise_nums[:] = saved`) rather than rebinding the attribute, or a
+   state captured before the playout keeps the post-playout counts and a replay
+   silently records different history tokens.
 8. **The opening state of a hand carries the previous hand's raise counts.**
    RLCard builds the first state before it rebinds `history_raise_nums`, so both
    `raw_obs["raise_nums"]` and the native `obs[52:72]` block are stale at the

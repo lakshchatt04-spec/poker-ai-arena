@@ -310,7 +310,12 @@ def restore(env: Any, snapshot: ForkSnapshot) -> dict[str, Any]:
         if not env.step_back():
             raise RuntimeError("step_back failed before reaching the fork point")
 
-    env.game.history_raise_nums = list(snapshot.raise_nums)
+    # Repair the list *in place*.  ``state["raw_obs"]["raise_nums"]`` is an
+    # alias to this exact list, so rebinding the attribute would leave the
+    # captured fork state pointing at the post-playout counts.  Recording the
+    # forked action from that stale state gives the replay different history
+    # tokens, and the policy quietly plays a different hand.
+    env.game.history_raise_nums[:] = list(snapshot.raise_nums)
     del env.action_recorder[snapshot.action_recorder_length:]
 
     restored = env.get_state(0)
