@@ -1888,6 +1888,129 @@ policy's own mixed opening (Stage 3b) supplies the collision naturally, so the
 training run does not script the agent's pre-flop action. The probe can now load
 a checkpoint with `--agent checkpoint --checkpoint PATH`.
 
+### Training: a benefit at training time, none at decision time
+
+Six 50-iteration runs -- history and control, seeds 0/1/2 -- used the Stage 3b
+mixed-preflop protocol (`entropy_coef_preflop = 0.1`), `coin_opener` as the
+scripted half of the training mix, and `coin_opener, passive, raiser_strong,
+raiser_loose` for evaluation. Final in-run evaluation against the training
+opponent (bb/hand, 95 % interval):
+
+| arm | seed 0 | seed 1 | seed 2 | mean |
+|---|---|---|---|---|
+| history | +0.4535 ±0.4319 | +0.2255 ±0.3103 | +0.3675 ±0.3487 | +0.3488 |
+| control | +0.3367 ±0.3350 | +0.0483 ±0.2235 | +0.0510 ±0.2207 | +0.1453 |
+
+Both arms start at about `-2.0` bb/hand at iteration 0 and learn to beat the
+bot, so the coin is worth a lot *as a learning target*: the memoryless arm
+already extracts about `+0.15` bb/hand. The paired comparison, which plays the
+same deals with both checkpoints, isolates the channel:
+
+| opponent | history − control, per seed | mean | seeds resolved |
+|---|---|---|---|
+| `coin_opener` | −0.0355 / +0.1938 / +0.4535 | **+0.2039** | 2/3 |
+| `passive` (held out) | −0.0190 / +0.0257 / +0.1310 | +0.0459 | 1/3 |
+| `raiser_strong` (held out) | −0.2995 / +0.0073 / +0.1405 | −0.0506 | 2/3 |
+| `raiser_loose` (held out) | −0.2395 / +0.0633 / +0.2290 | +0.0176 | 2/3 |
+
+The training-opponent advantage is real on two of three seeds, but its
+across-seed interval is `±0.61`, and it does not transfer to the three held-out
+bots. This is the same shape as Stage 3: a training-time benefit, not a general
+strength gain.
+
+### The advantage does not survive the ablation
+
+Zeroing the GRU output in the final history checkpoints, on the same deals:
+
+| opponent | ablation, per seed | mean | seeds resolved |
+|---|---|---|---|
+| `coin_opener` | +0.0330 / +0.0085 / +0.0040 | **+0.0152** | 0/3 |
+| `passive` | −0.0050 / +0.0185 / +0.0050 | +0.0062 | 1/3 |
+| `raiser_strong` | −0.0630 / +0.0450 / −0.0055 | −0.0078 | 2/3 |
+| `raiser_loose` | −0.0235 / +0.0345 / +0.0010 | +0.0040 | 0/3 |
+
+Against the opponent the channel was trained on, the ablation is `+0.0152`
+bb/hand -- 13 times smaller than the paired training advantage, identical on
+all three seeds in sign and inside the noise on all three. Removing the memory
+from the converged policy costs almost nothing.
+
+### Where the coin is hidden, the policy is not listening
+
+The probe of the three **final** policies (1,000 deals each) checks that the
+experiment still exists at the end of training:
+
+| seed | first flop decisions in mixed groups | complementary pre-flop response |
+|---|---|---|
+| 0 | 513 / 978 (52.5 %) | 55.0 % |
+| 1 | 491 / 937 (52.4 %) | 53.1 % |
+| 2 | 475 / 918 (51.7 %) | 52.9 % |
+
+More than half of the first flop decisions are still provably ambiguous, and
+the policy still uses the complementary response. The information is there.
+
+`scripts/history_probe.py` now also reports the decision-time test. For every
+mixed-group state it replays the *same* checkpoint with the history channel
+zeroed and compares the greedy action -- same cards, same public features, only
+the token stream differs:
+
+| arm (1,000 deals) | mixed decisions where zeroing changes the action |
+|---|---|
+| history seed 0 | 2 / 513 (0.4 %) |
+| history seed 1 | 1 / 491 (0.2 %) |
+| history seed 2 | 15 / 475 (3.2 %) |
+| control seed 0 | 2 / 364 (0.5 %) |
+
+`scripts/history_reliance.py` agrees on a larger state distribution: at the
+first flop decision, zeroing the channel changes `0 / 489`, `0 / 468` and
+`5 / 450` greedy actions for seeds 0/1/2, against a control-arm baseline of
+`0.2-0.4 %`. Reliance is larger (2.9-4.6 %) on later streets, where the mode is
+already public in the chips and raise counts. The channel is used, but only
+where it adds nothing.
+
+One measurement is easy to over-read and is now labelled in the report: within
+the mixed groups the policy bets on `14.9 %` of mode-0 decisions and `0.0 %` of
+mode-1 decisions (seed 0). That is **not** memory use. The complementary
+pre-flop response is a raise in one mode and a call in the other, so the two
+mode subsets contain different card ranges: mode 0 selects the hands the policy
+raised with. Only the counterfactual above holds the cards fixed.
+
+### Verdict for Stage 3c
+
+The private coin was the cleanest version of the experiment available: the
+hidden state is drawn from the bot's own RNG, it is independent of the agent's
+cards and actions, and it is provably absent from the observation. The result
+is still the Stage 3 pattern, and now it cannot be blamed on the agent's own
+policy:
+
+* training with the channel is worth about `+0.20` bb/hand on the training
+  opponent (2/3 seeds resolved, wide across-seed interval);
+* the converged policy uses the channel on about `1 %` of the decisions where
+  it is informative, at the untrained baseline;
+* the ablation is `+0.015` bb/hand, unresolved on every seed.
+
+Since the final weights do not depend on the channel, the training benefit
+cannot be an information advantage at play time. The most economical reading is
+that the recurrent pathway changes the optimisation -- it adds 16 dimensions to
+the head input and a gradient path through the token sequence -- and the
+converged greedy policy then discards it. A capacity or optimisation effect,
+not memory.
+
+### Agent A against these checkpoints
+
+The frozen Agent A (no memory, 100,869 parameters) against the final history
+checkpoints, positive = A better:
+
+| opponent | per seed | mean |
+|---|---|---|
+| `coin_opener` | −0.1540 / −0.0168 / −0.2635 | −0.1448 (B better, 3/3 sign) |
+| `passive` | +0.1165 / +0.1573 / +0.0130 | +0.0956 |
+| `raiser_strong` | +0.3790 / +0.1953 / +0.0775 | +0.2173 |
+| `raiser_loose` | +0.1755 / +0.1177 / −0.0870 | +0.0688 |
+
+B beats A only against the bot it trained on; A wins on every held-out
+opponent. The whole Agent B advantage here is opponent specialisation, not
+memory.
+
 ## Known pitfalls
 
 1. **`state["action_record"]` is a live list.** It is the same object as
@@ -1973,10 +2096,16 @@ a checkpoint with `--agent checkpoint --checkpoint PATH`.
   `CoinOpenerBettor`'s coin is independent of the agent, but the ambiguous flop
   state only occurs when the agent calls a bot raise and raises a bot call. A
   policy that opens both lines itself reveals the coin through the chips. The
-  probe measures the realised rate on the trained policy rather than assuming
-  it: `53.6 %` of first flop decisions and `56.0 %` of bot-opened hands at the
-  Stage 3b checkpoint. The coin-opener training result is therefore conditional
-  on the policy continuing to use a mixed, partly complementary opening.
+  probe measures the realised rate on the trained policies rather than assuming
+  it: after training, `51.7-52.5 %` of first flop decisions are still ambiguous
+  and `52.9-55.0 %` of bot-opened hands are still complementary, so the test is
+  not vacuous.
+* **The coin's decision-time value is not measured in bb/hand.** The ablation
+  says the channel is worth `+0.015` bb/hand to the converged policy, but that
+  is the value *of the learned policy's use of the channel*, not a ceiling.
+  A clairvoyant first flop decision could in principle be worth more, and the
+  one-dimensional first action is a narrow test of memory. The clairvoyance
+  ceiling is the recommended follow-up.
 * One unexplained cell: the history arm loses about `0.20` bb/hand to the
   control against a uniform-random opponent (2 of 3 seeds resolved). Random play
   is an out-of-distribution probe, not part of the protocol, and twelve
@@ -2005,6 +2134,7 @@ a checkpoint with `--agent checkpoint --checkpoint PATH`.
 | 5 | History-dependent opponent, identifiability probe and nine-run follow-up | ✅ done — memory helps training (`+0.276` bb/hand vs control); final policy relies on the card proxy |
 | 6 | Mixed pre-flop retrain, sampled-opening probe and decision-time ablation | ✅ done — reliance grows to `+0.057` bb/hand; about a quarter of the training gain retained |
 | 7 | Private-coin opponent, identifiability probe and reporting baseline | ✅ done — coin independent of the agent; 50.1 % of first flop decisions ambiguous, history 100 %, cards at chance |
+| 8 | Train history/control against the private coin | ✅ done — `+0.204` bb/hand at training time (2/3 seeds resolved), `+0.015` ablation (0/3), 1.2 % reliance at the hidden decision vs 0.5 % control |
 
 **Verdict: memory is a training-time scaffold that becomes a decision-time input
 when the opening is genuinely mixed.** Against the original memoryless
@@ -2020,21 +2150,23 @@ distribution -- gives the same `+0.057`. So the channel is now used, not merely
 learned through. About a quarter of the training benefit is retained at
 decision time; three seeds and a soft sampled break bound the claim.
 
-**Recommended next milestone: train against the private coin.** Stage 3c
-supplies the opponent and the probe, and the Stage 3b policy shows the collision
-survives a trained opening (`53.6 %` of first flop decisions ambiguous). The
-remaining work is the usual history-vs-control matrix against `coin_opener`,
-followed by the within-checkpoint ablation and a probe of the *final* policy's
-collision coverage. The coin is independent of the agent, so a positive ablation
-would be the cleanest memory result the project could report: the only way to
-know the opponent's post-flop plan is to remember who raised pre-flop. The main
-risk is that training moves the policy to an opening that reveals the coin; the
-checkpoint probe measures that directly.
+**Recommended next milestone: measure the value of the coin, not more of the
+same.** Stage 3c finished the private-coin experiment: the channel is worth
+`+0.20` bb/hand at training time and `+0.015` at decision time, with the
+converged policy using it on about `1 %` of the ambiguous decisions. Before
+spending compute on a fourth opponent, the cheap decisive measurement is a
+**clairvoyance ceiling**: at the first flop decision, fork the hand for each
+legal action and play out both under the bot's known next action, giving the
+value of choosing the first action with the coin known. If that ceiling is of
+order `0.01-0.03` bb/hand, then no amount of memory can produce a decision-time
+win in this design, the `+0.015` ablation is near optimal, and the project's
+conclusion is settled: the token stream helps PPO learn, not the final policy
+play.
 
-If that redesign is not worth the compute, the cheaper follow-up is more seeds
-on the mixed-pre-flop protocol. The ablation's per-seed spread is `sd 0.037` and
-only one of three seeds resolves; at `+0.057` bb/hand the effect is now large
-enough that a five-seed run would settle the mean.
+A cheaper alternative is a longer training run. Reliance in Stage 3b peaked
+around iteration 20 (`2.05 %`) and then decayed, which is consistent with the
+optimiser using the channel early and discarding it as the policy sharpens. A
+100-iteration run would test whether the decay is a transient or the attractor.
 
 A sensible remaining Stage 2 scope:
 
@@ -2105,6 +2237,12 @@ A sensible remaining Stage 2 scope:
     so the agent cannot reconstruct its own past action from its cards at all.~~
     ✅ Six runs with `entropy_coef_preflop = 0.1`; ablation rises to `+0.057`
     bb/hand and the sampled-opening probe reproduces it.
-20. Train the history and control arms against `coin_opener`, then run the
-    paired matrix, the ablation and a checkpoint probe. The coin is independent
-    of the agent, so the ablation is the clean memory test. Next.
+20. ~~Train the history and control arms against `coin_opener`, then run the
+    paired matrix, the ablation and a checkpoint probe.~~ ✅ Six runs.
+    History − control is `+0.204` bb/hand against the training opponent (2/3
+    seeds resolved) but the ablation is `+0.015` (0/3 resolved) and zeroing the
+    channel changes `1.2 %` of the mixed-group decisions against a `0.5 %`
+    control baseline. The private coin reproduces the training-time-only
+    result.
+21. Measure the clairvoyance ceiling at the first flop decision before adding
+    another opponent. Next.

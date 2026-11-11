@@ -19,6 +19,11 @@ That is a pure counterfactual on a fixed state distribution.  A policy that
 learned to use memory will change its action on a non-trivial fraction of
 decisions; a policy that ignores the channel will change on almost none.
 
+The first flop decision is reported separately.  That is the one decision where
+a private per-hand opponent coin is genuinely hidden: after the opponent's
+first post-flop action the mode is public.  A pooled rate over every decision
+understates reliance if the channel only matters there.
+
 The zero-history row is reported as a baseline: it is the same test on the
 control arm's weights, and it should be near zero because those weights never
 saw the history input.
@@ -27,6 +32,8 @@ Usage::
 
     python scripts\\history_reliance.py
     python scripts\\history_reliance.py --hands 1000 --seeds 0 1 2
+    python scripts\\history_reliance.py --opponent coin_opener --hands 500 ^
+        --history-prefix agent_b_coin
 """
 
 from __future__ import annotations
@@ -47,7 +54,7 @@ import torch
 
 from poker_arena.encoding import ObservationEncoder, small_blind_player
 from poker_arena.environment import make_environment, reset_hand
-from poker_arena.history import HistoryTracker
+from poker_arena.history import HistoryTracker, street_from_board_size
 from poker_arena.training import make_opponent
 from poker_arena.training_b import load_checkpoint_b
 
@@ -66,6 +73,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="base deal seed; hand h uses seed + h")
     parser.add_argument("--checkpoint-dir",
                         default=str(PROJECT_ROOT / "checkpoints"))
+    parser.add_argument("--history-prefix", default="agent_b",
+                        help="run-name prefix of the history arm (default: agent_b)")
+    parser.add_argument("--control-prefix", default="agent_b_control",
+                        help="run-name prefix of the control arm "
+                             "(default: agent_b_control)")
     parser.add_argument("--arm", default="history",
                         choices=["history", "control"],
                         help="which training arm's checkpoints to test")
@@ -78,8 +90,9 @@ def _record_states(net, encoder, env, hands, *, seed, opponent_name):
     """Play with history on and keep every decision state player 0 faced."""
 
     tracker = HistoryTracker()
-    recorded: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
-    decisions = 0
+    recorded: list[
+        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]
+    ] = []
 
     with torch.no_grad():
         for hand in range(hands):
@@ -90,6 +103,7 @@ def _record_states(net, encoder, env, hands, *, seed, opponent_name):
             state, player_id = reset_hand(env)
             small_blind = small_blind_player(state)
             tracker.start_hand(state)
+            postflop_decisions = 0
 
             while not env.is_over():
                 if player_id == 0:
@@ -97,15 +111,20 @@ def _record_states(net, encoder, env, hands, *, seed, opponent_name):
                         state, is_small_blind=(small_blind == player_id)
                     )
                     sequence = tracker.tokens(viewer=player_id)
+                    street = street_from_board_size(
+                        len(state["raw_obs"]["public_cards"])
+                    )
                     recorded.append(
                         (
                             encoded.features,
                             sequence.tokens,
                             sequence.mask,
                             encoded.legal_mask,
+                            street > 0 and postflop_decisions == 0,
                         )
                     )
-                    decisions += 1
+                    if street > 0:
+                        postflop_decisions += 1
                     logits, _ = net(
                         torch.from_numpy(encoded.features).unsqueeze(0),
                         torch.from_numpy(sequence.tokens).unsqueeze(0),
@@ -124,12 +143,12 @@ def _record_states(net, encoder, env, hands, *, seed, opponent_name):
 
 
 def _counterfactual(net, recorded):
-    """Return (fraction changed, mean |logit shift|) with history off vs on."""
+    """Return changed flags and logit shifts with history off vs on."""
 
-    changed = 0
+    changed: list[bool] = []
     shifts: list[float] = []
     with torch.no_grad():
-        for features, tokens, mask, legal in recorded:
+        for features, tokens, mask, legal, _ in recorded:
             batch = (
                 torch.from_numpy(features).unsqueeze(0),
                 torch.from_numpy(tokens).unsqueeze(0),
@@ -138,14 +157,20 @@ def _counterfactual(net, recorded):
             )
             logits_on, _ = net(*batch, use_history=True)
             logits_off, _ = net(*batch, use_history=False)
-            if int(torch.argmax(logits_on, dim=-1)) != int(
-                torch.argmax(logits_off, dim=-1)
-            ):
-                changed += 1
-            shifts.append(float((logits_on - logits_off).abs().max(dim=-1).values))
-    fraction = changed / len(recorded) if recorded else 0.0
-    mean_shift = float(np.mean(shifts)) if shifts else 0.0
-    return fraction, mean_shift
+            changed.append(
+                int(torch.argmax(logits_on, dim=-1))
+                != int(torch.argmax(logits_off, dim=-1))
+            )
+            shifts.append(
+                float((logits_on - logits_off).abs().max(dim=-1).values)
+            )
+    return changed, shifts
+
+
+def _summarise(changed: list[bool], shifts: list[float]) -> tuple[float, float]:
+    if not changed:
+        return float("nan"), float("nan")
+    return float(np.mean(changed)), float(np.mean(shifts))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -163,12 +188,11 @@ def main(argv: list[str] | None = None) -> int:
     print("                  decisions   action changes   mean |logit shift|")
     print("                  ---------   --------------   ------------------")
 
+    prefix = (
+        args.history_prefix if args.arm == "history" else args.control_prefix
+    )
     for seed in args.seeds:
-        name = (
-            f"agent_b_seed{seed}_{args.iteration:04d}.pt"
-            if args.arm == "history"
-            else f"agent_b_control_seed{seed}_{args.iteration:04d}.pt"
-        )
+        name = f"{prefix}_seed{seed}_{args.iteration:04d}.pt"
         path = directory / name
         if not path.is_file():
             print(f"  seed {seed}                 *missing* {name}")
@@ -180,13 +204,24 @@ def main(argv: list[str] | None = None) -> int:
             net, encoder, env, args.hands, seed=args.seed,
             opponent_name=args.opponent,
         )
-        fraction, mean_shift = _counterfactual(net, recorded)
+        changed, shifts = _counterfactual(net, recorded)
+        fraction, mean_shift = _summarise(changed, shifts)
+        first = [flag for *_, flag in recorded]
+        first_changed = [c for c, flag in zip(changed, first) if flag]
+        first_shifts = [s for s, flag in zip(shifts, first) if flag]
+        first_fraction, first_shift = _summarise(first_changed, first_shifts)
         print(
-            f"  seed {seed}         {len(recorded):>9}   {fraction:>12.3%}   "
+            f"  seed {seed} all     {len(recorded):>9}   {fraction:>12.3%}   "
             f"{mean_shift:>18.6f}"
+        )
+        print(
+            f"  seed {seed} flop 1  {len(first_changed):>9}   "
+            f"{first_fraction:>12.3%}   {first_shift:>18.6f}"
         )
 
     print()
+    print("'flop 1' is the agent's first post-flop decision, where a private")
+    print("per-hand opponent coin is still hidden.")
     print("The control arm is the baseline: its weights never saw the history, so")
     print("any change there is the network's untrained sensitivity to the channel.")
     return 0

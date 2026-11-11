@@ -43,6 +43,12 @@ Protocol:
 4. **Sanity check.**  Report how often the bot's first post-flop action is a bet
    or raise, split by mode.  If the two modes do not behave differently, the
    label is not worth predicting.
+5. **Decision-time use.**  Within the mixed groups, report how often the probe
+   agent itself bet or raised in each mode.  The features are identical there,
+   so a non-zero difference is the agent acting on the history tokens.  A probe
+   agent that ignores the coin scores zero even when the mode is perfectly
+   recoverable, which separates "the memory carries the coin" from "the policy
+   uses the memory".
 
 Reading: features-only near the majority baseline (and cards-only at the
 mixed-group baseline) means the mode is genuinely hidden and the training
@@ -175,10 +181,12 @@ def _collect(
     encoder = ObservationEncoder.from_environment(env)
     rng = np.random.default_rng(seed + 104_729)
     agent_policy = None
+    agent_policy_off = None
     if checkpoint is not None:
         net, _ = load_checkpoint_b(checkpoint)
         net.eval()
         agent_policy = AgentBPolicy(net, encoder)
+        agent_policy_off = AgentBPolicy(net, encoder, use_history=False)
 
     features: list[np.ndarray] = []
     tokens: list[np.ndarray] = []
@@ -190,6 +198,8 @@ def _collect(
     hand_labels: list[int | None] = [None] * int(hands)
     complement_labels: list[int] = [-1] * int(hands)
     first_postflop: list[tuple[int, int]] = []
+    chosen_actions: list[int] = []
+    counterfactual_actions: list[int] = []
 
     for hand in range(int(hands)):
         deal_seed = seed + hand
@@ -231,6 +241,9 @@ def _collect(
                     action = int(
                         agent_policy(state, player, tracker, small_blind)
                     )
+                    counterfactual_action = int(
+                        agent_policy_off(state, player, tracker, small_blind)
+                    )
                 elif agent_name == "random":
                     action = _random_action(state, rng)
                 elif agent_name == "complement":
@@ -254,6 +267,12 @@ def _collect(
                                 env.actions[action] == "raise"
                             )
                     agent_preflop_decisions += 1
+                else:
+                    chosen_actions.append(action)
+                    counterfactual_actions.append(
+                        counterfactual_action
+                        if agent_policy is not None else -1
+                    )
             else:
                 action = int(opponent(state, player))
                 if street == 0 and not bot_acted_preflop:
@@ -301,6 +320,8 @@ def _collect(
         "hand_ids": np.asarray(hand_ids, dtype=np.int64),
         "first_flop": np.asarray(first_flop_flags, dtype=bool),
         "complement": np.asarray(complement_labels, dtype=np.int64),
+        "actions": np.asarray(chosen_actions, dtype=np.int64),
+        "actions_off": np.asarray(counterfactual_actions, dtype=np.int64),
         "first_postflop": np.asarray(first_postflop, dtype=np.int64).reshape(-1, 2),
     }
 
@@ -544,6 +565,57 @@ def _report(args: argparse.Namespace, data: dict[str, np.ndarray]) -> str:
                     f"   mode {mode}: first post-flop action was a bet/raise "
                     f"in {rate:.1%} of {subset.shape[0]} hands"
                 )
+        lines.append("")
+
+    actions = data["actions"]
+    in_mixed = np.array([key in mixed_keys for key in keys], dtype=bool)
+    if actions.size == labels.size and in_mixed.any():
+        lines.append("4. Does the probe agent's own action depend on the mode?")
+        lines.append(
+            "   (mixed groups only: every non-card feature is identical)"
+        )
+        rates = {}
+        for mode in (0, 1):
+            subset = actions[in_mixed & (labels == mode)]
+            if subset.size:
+                rates[mode] = (float((subset == 1).mean()), int(subset.size))
+                lines.append(
+                    f"   mode {mode}: bet/raise on {rates[mode][0]:.1%} "
+                    f"of {rates[mode][1]} decisions"
+                )
+        lines.append(
+            "   cards are NOT identical across modes: the complementary"
+        )
+        lines.append(
+            "   pre-flop response is a raise in one mode and a call in the"
+        )
+        lines.append(
+            "   other, so the two ranges are selected differently. The bet"
+        )
+        lines.append(
+            "   rates above are descriptive, not a memory test."
+        )
+        actions_off = data["actions_off"]
+        if actions_off.size == actions.size and (actions_off >= 0).all():
+            changed = in_mixed & (actions_off != actions)
+            mode0 = in_mixed & (labels == 0)
+            mode1 = in_mixed & (labels == 1)
+            lines.append(
+                f"   zeroing the history channel changes the action on "
+                f"{int(changed.sum())} of {int(in_mixed.sum())} mixed "
+                f"decisions ({changed.sum() / in_mixed.sum():.1%})"
+            )
+            lines.append(
+                f"     mode 0: {int((changed & mode0).sum())} of "
+                f"{int(mode0.sum())}   "
+                f"mode 1: {int((changed & mode1).sum())} of {int(mode1.sum())}"
+            )
+            lines.append(
+                "     same state, same cards, same features: only the token"
+            )
+            lines.append(
+                "     stream differs, so this is the clean decision-time test"
+            )
         lines.append("")
 
     lines.append("Reading: features-only near the majority baseline (and")
