@@ -13,8 +13,9 @@ Two agents will eventually be trained with PPO and compared:
 **Research question:** *Does recurrent memory of opponent actions improve
 reinforcement-learning performance in heads-up poker?*
 
-**Current stage: complete through Stage 5, with a qualified answer to the
-research question.** Against the original memoryless scripted opponents, memory
+**Current stage: complete through the original five stages, plus the
+mixed-opening and private-coin follow-ups (roadmap rows 6-9), with a qualified
+answer to the research question.** Against the original memoryless scripted opponents, memory
 does not pay: training with the channel was worth `+0.007` to `+0.020` bb/hand
 over a capacity-matched control with the sign flipping across seeds, and zeroing
 the channel cost under `0.01` bb/hand. Against `first_raiser`, a bot whose
@@ -36,6 +37,16 @@ differently, so a deterministic card-based preflop policy can recover the mode
 without memory. The body of the README reports both experiments, the
 identifiability probes, the paired matrices, the reliance curves, and the
 limitations.
+
+Against a private-coin opponent -- whose hidden mode is drawn independently of
+the agent, provably absent from the observation, and still visible in the action
+record -- the same pattern appears: `+0.204` bb/hand at training time and
+`+0.015` at decision time. A fork-and-replay **clairvoyance ceiling** settles
+whether that gap is a limit of the information or of the optimiser. Perfect
+knowledge of the coin at the first flop decision is worth **`+1.37` bb per
+ambiguous decision (`+0.65` bb/hand over all deals)**, so the converged policy
+captures about **2 %** of what the information could buy. The hidden state is
+valuable; PPO with this architecture does not build a policy that uses it.
 
 Stage 1 exists so later results are not built on guesses about RLCard's
 observations, actions, payoffs or history handling. The history encoding is data
@@ -1974,6 +1985,55 @@ pre-flop response is a raise in one mode and a call in the other, so the two
 mode subsets contain different card ranges: mode 0 selects the hands the policy
 raised with. Only the counterfactual above holds the cards fixed.
 
+### What perfect knowledge of the coin would have been worth
+
+The ablation measures what the channel *is* used for (`+0.015` bb/hand). It does
+not say what the coin is *worth*. `scripts/clairvoyance_ceiling.py` answers
+that; the full per-seed report is written to `runs/clairvoyance_ceiling.md`. It
+replays each deal to the agent's first flop decision, snapshots the
+game, values **every legal action on the same sampled turn/river runouts**, and
+restores the fork. Because the runouts are shared, the comparison between
+actions is paired. Only states whose card-free betting summary appears under
+both coin values are used, and every used deal passes a natural-replay check:
+the action the policy actually chose, replayed on the natural runout, must
+reproduce the hand's real payoff.
+
+Three estimators bracket the per-decision ceiling. **Cross-fitted** selects the
+best action on half the runouts and scores it on the other half (lower bound);
+**in-sample** selects and scores on all runouts (upper bound, because the
+maximum of a finite sample is biased upward); **per-runout** takes the best
+action separately on each runout (foresight of the runout, not achievable at
+decision time, reported as a scale).
+
+The history checkpoints, 1,000 deals per seed, 32 sampled runouts plus the
+natural one:
+
+| seed | first flops | mixed (used) | cross-fitted | in-sample | per-runout | already best | per deal |
+|---|---|---|---|---|---|---|---|
+| 0 | 975 / 1000 | 500 | **+1.7956** ± 0.3268 | +1.9128 | +3.7181 | 32.8 % | +0.8978 |
+| 1 | 933 / 1000 | 459 | **+1.1726** ± 0.2217 | +1.2936 | +2.7295 | 41.0 % | +0.5382 |
+| 2 | 897 / 1000 | 471 | **+1.0975** ± 0.2762 | +1.2052 | +2.4033 | 43.3 % | +0.5169 |
+| **pooled** | 2,805 / 3,000 | 1,430 | **+1.3657** ± 0.1632 | +1.4810 ± 0.1605 | +2.9677 ± 0.2029 | 38.9 % | **+0.6510** |
+
+Values are bb per mixed first flop decision; the last column spreads the
+cross-fitted value over every deal. Intervals are 95 %, normal approximation
+over decisions. "Already best" is the share of mixed decisions where the
+deployed action is the in-sample argmax.
+
+Perfect knowledge of the coin at the first flop decision is worth **`+1.37` bb
+per ambiguous decision**, or `+0.65` bb/hand over all deals. The channel's
+decision-time ablation is `+0.0152` bb/hand, so the converged policy captures
+about **2 %** of the available value. The cross-fitted and in-sample rows are
+close, so selection bias is small; the much larger per-runout row confirms that
+a substantial share of the value depends on the turn and river.
+
+Two conclusions follow. The hidden state is valuable, so this is not a design in
+which the ablation was near optimal. And the failure to exploit it is an
+optimisation or capacity effect: the input contains the coin, and a clairvoyant
+first action is worth `+0.65` bb/hand, but PPO with this network does not build
+the mode-conditional first action. Because the continuation is held at the
+deployed policy, `+1.37` is a lower bound on a fully coin-aware policy.
+
 ### Verdict for Stage 3c
 
 The private coin was the cleanest version of the experiment available: the
@@ -1986,14 +2046,19 @@ policy:
   opponent (2/3 seeds resolved, wide across-seed interval);
 * the converged policy uses the channel on about `1 %` of the decisions where
   it is informative, at the untrained baseline;
-* the ablation is `+0.015` bb/hand, unresolved on every seed.
+* the ablation is `+0.015` bb/hand, unresolved on every seed;
+* but perfect knowledge of the coin at that decision is worth `+1.37` bb per
+  ambiguous decision (`+0.65` bb/hand over all deals), so the policy captures
+  about `2 %` of the value the information could buy.
 
 Since the final weights do not depend on the channel, the training benefit
 cannot be an information advantage at play time. The most economical reading is
 that the recurrent pathway changes the optimisation -- it adds 16 dimensions to
 the head input and a gradient path through the token sequence -- and the
 converged greedy policy then discards it. A capacity or optimisation effect,
-not memory.
+not memory. The ceiling rules out the other explanation, that the coin was worth
+too little for the ablation to differ from zero: there was `+0.65` bb/hand on
+the table, and the converged policy left nearly all of it.
 
 ### Agent A against these checkpoints
 
@@ -2104,12 +2169,16 @@ memory.
   it: after training, `51.7-52.5 %` of first flop decisions are still ambiguous
   and `52.9-55.0 %` of bot-opened hands are still complementary, so the test is
   not vacuous.
-* **The coin's decision-time value is not measured in bb/hand.** The ablation
-  says the channel is worth `+0.015` bb/hand to the converged policy, but that
-  is the value *of the learned policy's use of the channel*, not a ceiling.
-  A clairvoyant first flop decision could in principle be worth more, and the
-  one-dimensional first action is a narrow test of memory. The clairvoyance
-  ceiling is the recommended follow-up.
+* **The clairvoyance ceiling is a one-decision oracle.** It values the first
+  flop action with the coin known while holding the deployed continuation
+  fixed, so it is a lower bound on a fully coin-aware policy. It covers the
+  first flop decision only, uses 32 sampled runouts (cross-fitted in halves),
+  and applies only to states whose card-free summary appears under both coins
+  (about half of deals). The cross-fitted and in-sample estimates being close
+  (`+1.37` vs `+1.48`) bounds the finite-runout selection bias; the per-runout
+  value (`+2.97`) includes runout luck and is not achievable at decision time.
+  The ceiling measures the value of the information, not whether *any* training
+  method could extract it.
 * One unexplained cell: the history arm loses about `0.20` bb/hand to the
   control against a uniform-random opponent (2 of 3 seeds resolved). Random play
   is an out-of-distribution probe, not part of the protocol, and twelve
@@ -2139,6 +2208,7 @@ memory.
 | 6 | Mixed pre-flop retrain, sampled-opening probe and decision-time ablation | ✅ done — reliance grows to `+0.057` bb/hand; about a quarter of the training gain retained |
 | 7 | Private-coin opponent, identifiability probe and reporting baseline | ✅ done — coin independent of the agent; 50.1 % of first flop decisions ambiguous, history 100 %, cards at chance |
 | 8 | Train history/control against the private coin | ✅ done — `+0.204` bb/hand at training time (2/3 seeds resolved), `+0.015` ablation (0/3), 1.2 % reliance at the hidden decision vs 0.5 % control |
+| 9 | Clairvoyance ceiling on the private coin | ✅ done — perfect knowledge of the coin is worth `+1.37` bb per ambiguous decision (`+0.65` bb/hand over all deals); the policy captures about 2 % |
 
 **Verdict: memory is a training-time scaffold that becomes a decision-time input
 when the opening is genuinely mixed.** Against the original memoryless
@@ -2154,23 +2224,23 @@ distribution -- gives the same `+0.057`. So the channel is now used, not merely
 learned through. About a quarter of the training benefit is retained at
 decision time; three seeds and a soft sampled break bound the claim.
 
-**Recommended next milestone: measure the value of the coin, not more of the
-same.** Stage 3c finished the private-coin experiment: the channel is worth
-`+0.20` bb/hand at training time and `+0.015` at decision time, with the
-converged policy using it on about `1 %` of the ambiguous decisions. Before
-spending compute on a fourth opponent, the cheap decisive measurement is a
-**clairvoyance ceiling**: at the first flop decision, fork the hand for each
-legal action and play out both under the bot's known next action, giving the
-value of choosing the first action with the coin known. If that ceiling is of
-order `0.01-0.03` bb/hand, then no amount of memory can produce a decision-time
-win in this design, the `+0.015` ablation is near optimal, and the project's
-conclusion is settled: the token stream helps PPO learn, not the final policy
-play.
+The private-coin experiment removes the agent's own opening from the
+confound and adds the ceiling. Training with the channel is worth `+0.204`
+bb/hand, the ablation is `+0.015`, and perfect knowledge of the coin at the first
+flop decision is worth `+0.651` bb/hand. The information was there and valuable;
+the converged policy used about 2 % of it. That is the cleanest evidence that
+the recurrent channel acts on PPO's optimisation, not on the deployed policy.
 
-A cheaper alternative is a longer training run. Reliance in Stage 3b peaked
-around iteration 20 (`2.05 %`) and then decayed, which is consistent with the
-optimiser using the channel early and discarding it as the policy sharpens. A
-100-iteration run would test whether the decay is a transient or the attractor.
+**Measured: the coin is worth `+0.65` bb/hand and the policy captures 2 %.**
+Stage 3c's `+0.015` ablation was consistent with two stories -- the information
+was worthless, or the policy could not use it. The ceiling separates them, and it
+came in far above the `0.01-0.03` bb/hand that would have settled the project in
+memory's favour. The next cheap question is therefore about optimisation, not
+opponents: Stage 3b's reliance peaked near iteration 20 and then decayed, so a
+100-iteration run tests whether that decay is transient or the attractor. If
+reliance still decays, the natural follow-up is an auxiliary head that predicts
+the hidden mode, or more capacity, both of which change the research question
+from "does memory help?" to "what supervision makes memory help?".
 
 A sensible remaining Stage 2 scope:
 
