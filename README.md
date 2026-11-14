@@ -14,7 +14,7 @@ Two agents will eventually be trained with PPO and compared:
 reinforcement-learning performance in heads-up poker?*
 
 **Current stage: complete through the original five stages, plus the
-mixed-opening and private-coin follow-ups (roadmap rows 6-9), with a qualified
+mixed-opening and private-coin follow-ups (roadmap rows 6-10), with a qualified
 answer to the research question.** Against the original memoryless scripted opponents, memory
 does not pay: training with the channel was worth `+0.007` to `+0.020` bb/hand
 over a capacity-matched control with the sign flipping across seeds, and zeroing
@@ -24,8 +24,9 @@ training with memory is worth **`+0.276` bb/hand over the control** on the
 training opponent (3/3 seeds positive, 2/3 resolved) and is positive on every
 held-out opponent (3/3 seeds each). But the trained policy still barely uses the
 channel: the within-checkpoint ablation is `-0.007` bb/hand and removing it
-changes only 0.4-1.3 % of greedy actions. The evidence points to memory acting
-as a **training-time scaffold**: it lets PPO find the mode-conditional strategy,
+changes only 0.4-1.3 % of greedy actions. In these sharp-opening runs the
+evidence points to memory acting as a **training-time scaffold**: it lets PPO
+find the mode-conditional strategy,
 after which the trunk absorbs a features-only proxy for the mode. Breaking that
 proxy at evaluation time does not revive reliance (`+0.0035` bb/hand), so the
 channel is not decision-relevant even when the features cannot reveal the
@@ -38,10 +39,19 @@ without memory. The body of the README reports both experiments, the
 identifiability probes, the paired matrices, the reliance curves, and the
 limitations.
 
+Keeping the pre-flop opening mixed changes the answer (Stage 3b). At 50
+iterations training with memory is worth `+0.236` bb/hand and the
+within-checkpoint ablation is `+0.057`; doubling training to 100 iterations
+shrinks the training-time gap to `+0.055` as the control catches up, but the
+ablation holds at `+0.045` and the channel's mean logit shift stays flat from
+iteration 10 to 100. The channel is a **permanent decision-time input**, not a
+scaffold; most of the 50-iteration training advantage was faster learning.
+
 Against a private-coin opponent -- whose hidden mode is drawn independently of
 the agent, provably absent from the observation, and still visible in the action
-record -- the same pattern appears: `+0.204` bb/hand at training time and
-`+0.015` at decision time. A fork-and-replay **clairvoyance ceiling** settles
+record -- the same pattern appears at the same 50-iteration budget: `+0.204`
+bb/hand at training time and `+0.015` at decision time. A fork-and-replay
+**clairvoyance ceiling** settles
 whether that gap is a limit of the information or of the optimiser. Perfect
 knowledge of the coin at the first flop decision is worth **`+1.37` bb per
 ambiguous decision (`+0.65` bb/hand over all deals)**, so the converged policy
@@ -1601,8 +1611,9 @@ iteration 50, turning the channel off changes the greedy action on
 absolute logit shift of `0.26-0.40`; the control weights, which never saw the
 channel, change `0.11-0.20 %` with a shift of `0.11-0.17`.
 
-Tracking reliance across checkpoints explains how the two results fit together.
-Mean action-change rate when the channel is zeroed:
+Tracking reliance across checkpoints of **these sharp-opening runs** explains how
+the two results fit together. Mean action-change rate when the channel is
+zeroed:
 
 | iteration | 10 | 20 | 30 | 40 | 50 |
 |---|---|---|---|---|---|
@@ -1614,6 +1625,12 @@ discover the mode-conditional response, and the trunk subsequently absorbs the
 same information into a features-only representation. The final policy is
 therefore close to memoryless even though the training run that produced it
 benefited from memory.
+
+That peak is a property of the sharp-opening runs, not of the channel in
+general: the mixed-opening Stage 3b checkpoints below show a flat reliance
+curve with no decay. The difference is the proxy. When the opening is a
+deterministic function of the hole cards, the features can reproduce the
+history, so the trunk has something to absorb it into.
 
 ### Breaking the proxy at evaluation time
 
@@ -1756,7 +1773,9 @@ is also no longer confined to the training opponent: `raiser_loose` gains
 time, not just during learning.
 
 The retained fraction is still modest: `0.057` of the `0.236` training gain,
-about a quarter. The rest remains a learning effect, as in Stage 3. But the
+about a quarter. The rest remains a learning effect, as in Stage 3. The
+100-iteration extension below shows that this residual is mostly faster
+learning: the control catches up. But the
 sign of the Stage 3 conclusion has changed: memory is no longer only a scaffold.
 
 ### Sampling the opening instead of forcing it
@@ -1796,20 +1815,90 @@ from the trained network, the same quarter rates are `26.5-29.9 %` /
 hand strength. The trunk has to read the actual action sequence to know its own
 past.
 
+### Reliance does not decay, but the training advantage does
+
+The 50-iteration run left an obvious question: was the `+0.057` ablation a
+transient stage that longer training would absorb? Six more runs (history and
+control, seeds 0/1/2) extend the same protocol to 100 iterations. All six
+iteration-50 checkpoints are **weight-identical** to the earlier runs (the file
+hashes differ only in serialisation metadata), so this is one continuous curve
+from 0 to 100.
+
+Reliance on the same fixed state distribution (500 deals per seed against
+`first_raiser`; "flop" is the agent's first post-flop decision, "all" is every
+recorded decision; pooled over three seeds):
+
+| iteration | history flop flip % | control flop flip % | history flop shift | control flop shift | history all shift | control all shift |
+|---|---|---|---|---|---|---|
+| 0 | 12.26 | 12.26 | 0.00 | 0.00 | 0.00 | 0.00 |
+| 10 | 2.20 | 0.00 | 0.49 | 0.21 | 0.60 | 0.20 |
+| 20 | 1.07 | 1.73 | 0.65 | 0.24 | 0.96 | 0.23 |
+| 30 | 2.84 | 0.73 | 0.50 | 0.23 | 0.87 | 0.22 |
+| 40 | 1.74 | 0.49 | 0.54 | 0.21 | 0.95 | 0.21 |
+| 50 | 0.75 | 0.56 | 0.60 | 0.22 | 1.04 | 0.22 |
+| 60 | 0.68 | 0.21 | 0.60 | 0.24 | 1.04 | 0.23 |
+| 70 | 0.62 | 0.35 | 0.63 | 0.23 | 1.07 | 0.23 |
+| 80 | 0.53 | 0.78 | 0.73 | 0.26 | 1.18 | 0.26 |
+| 90 | 1.30 | 0.28 | 0.54 | 0.28 | 0.93 | 0.27 |
+| 100 | 1.18 | 0.45 | 0.70 | 0.23 | 1.01 | 0.23 |
+
+Iteration 0 is the untrained network: history-on and history-off are identical,
+so its 12 % flip rate is near-ties (shift `0.0005`), not reliance. From
+iteration 10 onward the channel's mean logit shift is flat, or slightly rising:
+`0.49-0.73` at the first flop and `0.87-1.18` over all decisions against a
+control baseline of `0.20-0.28`. The 50-100 block is *larger* than the 10-50
+block on both axes (`0.39` vs `0.34`, `0.80` vs `0.66`). Nothing is being
+absorbed.
+
+What does fall, once, is the rate at which the perturbation crosses the argmax
+at the first flop: `2.2 %` at iteration 10 to `0.5-1.3 %` from iteration 50 on.
+That is confidence, not absorption -- the shift is unchanged while the policy
+moves away from its decision boundaries. The counts are small (at iteration
+100, 16/1,353 first-flop flips for history vs 6/1,330 for control); over all
+decisions the flip rate stays at `3-6 %` against `0.7-1.6 %` for the control.
+
+The paired matrices at 50 and 100 tell the other half of the story:
+
+| opponent | history minus control at 50 | at 100 | ablation (history on minus off) at 50 | at 100 |
+|---|---|---|---|---|
+| first_raiser | +0.2355 | +0.0553 | +0.0570 | +0.0447 |
+| passive | +0.0733 | +0.0172 | +0.0148 | -0.0068 |
+| raiser_strong | +0.1703 | +0.0371 | -0.0078 | -0.0338 |
+| raiser_loose | +0.1873 | +0.0149 | +0.0480 | +0.0265 |
+
+The training-time advantage shrinks by 3-5x; the control arm catches up. The
+decision-time ablation does not: against `first_raiser` it stays
+`+0.045` (3/3 seeds positive, one resolved). The channel remains a real
+decision-time input; what was transient was the *performance gap between the two
+training arms*, most of which was faster learning by the history arm. At
+iteration 100 the remaining gap (`+0.055`) and the channel's decision-time value
+(`+0.045`) are nearly the same number, so the deployed channel now accounts for
+most of what memory still buys. Against `raiser_strong` the channel is mildly
+negative, as it was at 50.
+
+So the answer to the pre-registered question is **permanent**: 100 iterations
+does not absorb the channel, and the mixed-opening policy never develops the
+mid-training reliance peak that the sharp-opening Stage 3 runs showed. The
+scaffold framing was measured against a control that had not converged.
+
 ### Verdict for Stage 3b
 
-**A genuinely mixed pre-flop policy makes memory decision-relevant.**
+**A genuinely mixed pre-flop policy makes memory decision-relevant, and the
+channel does not decay with longer training.**
 
-1. Training-time benefit survives (`+0.236` bb/hand over the control against
-   `first_raiser`, 3/3 seeds positive) and grows on the held-out raisers
-   (`+0.170`, `+0.187`).
-2. Decision-time reliance rises roughly tenfold, to `+0.057` bb/hand
+1. At 50 iterations the training-time benefit survives (`+0.236` bb/hand over
+   the control against `first_raiser`, 3/3 seeds positive) and grows on the
+   held-out raisers (`+0.170`, `+0.187`).
+2. Decision-time reliance rises roughly tenfold at 50, to `+0.057` bb/hand
    (`3/3` seeds positive, one resolved), against `−0.007` in Stage 3.
-3. Sampling the opening does not raise reliance above the greedy level
+3. Doubling training to 100 iterations shrinks the training-time gap to
+   `+0.055`, because the control catches up, but the ablation holds at
+   `+0.045` (3/3 seeds positive). The channel is not absorbed: its mean logit
+   shift is flat at `0.6-0.7` at the first flop and `~1.0` overall from
+   iteration 10 to 100, against `0.2-0.3` for the control.
+4. Sampling the opening does not raise reliance above the greedy level
    (`+0.0567` vs `+0.0570`), so the gain is not a proxy artefact: the network
    uses the action channel itself.
-4. About a quarter of the training benefit is retained at decision time. The
-   rest is still a learning effect.
 
 The caveat is that `sampled` is a softer break than `forced`: the action
 probabilities still depend on the cards, just not one-to-one. `forced` also
@@ -2060,6 +2149,13 @@ not memory. The ceiling rules out the other explanation, that the coin was worth
 too little for the ablation to differ from zero: there was `+0.65` bb/hand on
 the table, and the converged policy left nearly all of it.
 
+One caveat comes from the Stage 3b extension: these are 50-iteration controls,
+and at 100 iterations the mixed-opening control closed most of the training
+gap. Part of the `+0.204` here may likewise be a head start rather than a
+permanent advantage. The ablation -- the decision-time claim -- is unaffected by
+that, but extending the private-coin runs to 100 iterations would separate the
+two readings directly.
+
 ### Agent A against these checkpoints
 
 The frozen Agent A (no memory, 100,869 parameters) against the final history
@@ -2141,8 +2237,9 @@ memory.
 * The encoder, the policy/value network, the rollout buffer, the PPO update and
   the training loop all exist. Agent B's network, rollout, PPO updater, training
   loop, checkpointing, paired comparison and history-reliance diagnostic are
-  implemented, tested and exercised on twenty-one runs (the six original runs,
-  the nine Stage 3 runs and the six pre-flop-entropy runs).
+  implemented, tested and exercised on twenty-seven runs (the six original
+  runs, the nine Stage 3 runs, the six pre-flop-entropy runs and the six
+  100-iteration mixed-opening runs).
 * Agent B's comparison is confounded slightly by capacity: B has `+15.9 %` more
   parameters than A. The control arm (same capacity, no history input) removes
   that confound for the "memory vs no memory" question, but the headline A-vs-B
@@ -2154,9 +2251,16 @@ memory.
   evaluation time does not revive reliance (`+0.0035`, 1/6 cells). With a
   genuinely mixed opening (`entropy_coef_preflop = 0.1`), the training gain is
   `+0.236`, the ablation rises to `+0.057` (3/3 seeds positive), and sampling
-  the opening leaves it unchanged (`+0.0567`). About a quarter of the training
-  benefit is now retained at decision time. The mechanism -- a scaffold that
-  the trunk partly absorbs -- is still inferred, not proven.
+  the opening leaves it unchanged (`+0.0567`). At 100 iterations the ablation
+  holds at `+0.045` and the logit-shift curve is flat, so the channel is not a
+  transient scaffold; the training gain itself falls to `+0.055` as the control
+  catches up.
+* **The 100-iteration comparison has not resolved the residual gap.** The
+  history-minus-control means at 100 are positive on all four opponents
+  (`+0.055`, `+0.017`, `+0.037`, `+0.015`) but no cell resolves. The claim that
+  the control catches up is supported by the 3-5x drop from 50 and by the
+  absolute held-out evaluations, not by a significant interaction. More seeds
+  or more hands would be needed to say whether a small permanent edge remains.
 * **The hidden-mode opponent is imperfect.** `FirstRaiserBettor` can misclassify
   itself as the first raiser when it re-raises after the agent opened, so its
   intended post-flop mode is not always realized (`70.7 %` bet rate in mode 1).
@@ -2205,27 +2309,32 @@ memory.
 | 3 | Agent B: MLP + GRU over betting history, trained with PPO | ✅ done — three seeds trained, paired against the control arm |
 | 4 | Head-to-head evaluation, ablations and results write-up | ✅ done — paired matrix and verdict above |
 | 5 | History-dependent opponent, identifiability probe and nine-run follow-up | ✅ done — memory helps training (`+0.276` bb/hand vs control); final policy relies on the card proxy |
-| 6 | Mixed pre-flop retrain, sampled-opening probe and decision-time ablation | ✅ done — reliance grows to `+0.057` bb/hand; about a quarter of the training gain retained |
+| 6 | Mixed pre-flop retrain, sampled-opening probe and decision-time ablation | ✅ done — reliance grows to `+0.057` bb/hand at 50 iterations (extended by row 10) |
 | 7 | Private-coin opponent, identifiability probe and reporting baseline | ✅ done — coin independent of the agent; 50.1 % of first flop decisions ambiguous, history 100 %, cards at chance |
 | 8 | Train history/control against the private coin | ✅ done — `+0.204` bb/hand at training time (2/3 seeds resolved), `+0.015` ablation (0/3), 1.2 % reliance at the hidden decision vs 0.5 % control |
 | 9 | Clairvoyance ceiling on the private coin | ✅ done — perfect knowledge of the coin is worth `+1.37` bb per ambiguous decision (`+0.65` bb/hand over all deals); the policy captures about 2 % |
+| 10 | Extend the mixed-opening runs to 100 iterations and test whether reliance decays | ✅ done — reliance is flat from iteration 10 to 100 (`~0.6` flop, `~1.0` all-decision logit shift vs `0.2-0.3` control); the ablation holds at `+0.045`, while the training-time gap shrinks from `+0.236` to `+0.055` as the control catches up |
 
-**Verdict: memory is a training-time scaffold that becomes a decision-time input
-when the opening is genuinely mixed.** Against the original memoryless
+**Verdict: memory is a permanent decision-time input when the opening is
+genuinely mixed, and none of the mixed-opening advantage is a lasting
+performance edge.** Against the original memoryless
 opponents it was worth nothing and the sign flipped across seeds. Against
 `first_raiser` with a sharp card-based opening, training with the channel was
 worth `+0.276` bb/hand over the capacity-matched control, but zeroing the
 trained channel cost `0.007`: the trunk had distilled the hidden variable into a
 features-only proxy. Adding a pre-flop-only entropy bonus (`0.1`) makes the
-opening genuinely mixed. The training gain is similar (`+0.236`), the ablation
-rises to `+0.057` (3/3 seeds positive, one resolved), and a sampled-opening
-probe -- which removes the card proxy without leaving the policy's own
-distribution -- gives the same `+0.057`. So the channel is now used, not merely
-learned through. About a quarter of the training benefit is retained at
-decision time; three seeds and a soft sampled break bound the claim.
+opening genuinely mixed. At 50 iterations the training gain is similar
+(`+0.236`), the ablation rises to `+0.057` (3/3 seeds positive, one resolved),
+and a sampled-opening probe -- which removes the card proxy without leaving the
+policy's own distribution -- gives the same `+0.057`. Doubling training to 100
+iterations shrinks the training-time gap to `+0.055` (the control catches up)
+while the ablation holds at `+0.045` and the channel's logit shift does not
+fall. So the channel is used, and stays used; most of the 50-iteration gap was
+faster learning. Three seeds and a soft sampled break bound the claim.
 
 The private-coin experiment removes the agent's own opening from the
-confound and adds the ceiling. Training with the channel is worth `+0.204`
+confound and adds the ceiling. At the same 50-iteration budget, training with
+the channel is worth `+0.204`
 bb/hand, the ablation is `+0.015`, and perfect knowledge of the coin at the first
 flop decision is worth `+0.651` bb/hand. The information was there and valuable;
 the converged policy used about 2 % of it. That is the cleanest evidence that
@@ -2236,11 +2345,12 @@ Stage 3c's `+0.015` ablation was consistent with two stories -- the information
 was worthless, or the policy could not use it. The ceiling separates them, and it
 came in far above the `0.01-0.03` bb/hand that would have settled the project in
 memory's favour. The next cheap question is therefore about optimisation, not
-opponents: Stage 3b's reliance peaked near iteration 20 and then decayed, so a
-100-iteration run tests whether that decay is transient or the attractor. If
-reliance still decays, the natural follow-up is an auxiliary head that predicts
-the hidden mode, or more capacity, both of which change the research question
-from "does memory help?" to "what supervision makes memory help?".
+opponents. The 100-iteration test has now ruled out the decay explanation for
+Stage 3b: reliance is flat, so the mixed-opening channel is not being absorbed
+and the remaining question is why it is worth only `+0.045` when a perfect
+signal is worth `+0.65`. The natural follow-up is an auxiliary head that
+predicts the hidden mode, or more capacity, both of which change the research
+question from "does memory help?" to "what supervision makes memory help?".
 
 A sensible remaining Stage 2 scope:
 
@@ -2318,5 +2428,12 @@ A sensible remaining Stage 2 scope:
     channel changes `1.2 %` of the mixed-group decisions against a `0.5 %`
     control baseline. The private coin reproduces the training-time-only
     result.
-21. Measure the clairvoyance ceiling at the first flop decision before adding
-    another opponent. Next.
+21. ~~Measure the clairvoyance ceiling at the first flop decision before adding
+    another opponent.~~ ✅ Perfect knowledge of the coin is worth `+1.37` bb per
+    ambiguous decision (`+0.65` bb/hand); the policy captures about `2 %`.
+22. ~~Extend the mixed-opening history/control runs to 100 iterations and test
+    whether the reliance decay is permanent.~~ ✅ Reliance is flat from 10 to
+    100 (logit shift `~0.6`/`~1.0` against a `0.2-0.3` control); the ablation
+    holds at `+0.045` while the training gap falls to `+0.055`. Next: extend
+    the private-coin runs to 100 iterations, then try an auxiliary mode-prediction
+    head or more capacity.
