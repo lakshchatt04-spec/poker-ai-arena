@@ -1857,6 +1857,26 @@ moves away from its decision boundaries. The counts are small (at iteration
 100, 16/1,353 first-flop flips for history vs 6/1,330 for control); over all
 decisions the flip rate stays at `3-6 %` against `0.7-1.6 %` for the control.
 
+Splitting the same states by street shows where the channel is actually used:
+its influence **grows with the length of the sequence**.
+
+| street | decisions | history shift | control shift | ratio | history flips | control flips | median margin |
+|---|---|---|---|---|---|---|---|
+| preflop | 1,841 | 0.12 | 0.05 | 2.4x | 6.9 % | 3.9 % | 0.08-0.24 |
+| flop | 1,645 | 0.83 | 0.24 | 3.4x | 1.2 % | 0.4 % | 1.4-2.0 |
+| turn | 1,451 | 1.47 | 0.32 | 4.6x | 3.2 % | 0.6 % | 1.2-1.6 |
+| river | 1,551 | 1.85 | 0.35 | 5.3x | 5.1 % | 1.0 % | 1.1-1.8 |
+
+The shift ratio doubles from the flop to the river, and the absolute shift
+reaches `1.85`, more than five times the untrained baseline. The pre-flop row is
+the exception and is a tie artefact, not reliance: the pre-flop policy is nearly
+indifferent between legal actions (median greedy margin `0.08-0.24`, against
+`1.1-2.0` post-flop), so even the smallest shift (`0.12`) crosses the boundary
+on `6.9 %` of decisions. Seed 2 confirms the mechanism -- the loosest pre-flop
+margins (`0.237`) give the lowest pre-flop flip rate (`0.9 %`) -- and
+`history_reliance.py` prints the margin column so the flip rate cannot be read
+as reliance on its own.
+
 The paired matrices at 50 and 100 tell the other half of the story:
 
 | opponent | history minus control at 50 | at 100 | ablation (history on minus off) at 50 | at 100 |

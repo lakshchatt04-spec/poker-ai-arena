@@ -144,10 +144,11 @@ def _record_states(net, encoder, env, hands, *, seed, opponent_name):
 
 
 def _counterfactual(net, recorded):
-    """Return changed flags and logit shifts with history off vs on."""
+    """Return changed flags, logit shifts and greedy margins vs history off."""
 
     changed: list[bool] = []
     shifts: list[float] = []
+    margins: list[float] = []
     with torch.no_grad():
         for features, tokens, mask, legal, *_ in recorded:
             batch = (
@@ -165,7 +166,9 @@ def _counterfactual(net, recorded):
             shifts.append(
                 float((logits_on - logits_off).abs().max(dim=-1).values)
             )
-    return changed, shifts
+            top = torch.topk(logits_on, 2, dim=-1).values
+            margins.append(float((top[..., 0] - top[..., 1]).item()))
+    return changed, shifts, margins
 
 
 def _summarise(changed: list[bool], shifts: list[float]) -> tuple[float, float]:
@@ -178,11 +181,11 @@ STREET_NAMES = ("preflop", "flop", "turn", "river")
 
 
 def _street_rows(
-    recorded, changed, shifts
-) -> list[tuple[str, int, float, float]]:
+    recorded, changed, shifts, margins
+) -> list[tuple[str, int, float, float, float]]:
     """Group the counterfactual by the street each decision was taken on."""
 
-    rows: list[tuple[str, int, float, float]] = []
+    rows: list[tuple[str, int, float, float, float]] = []
     for street, name in enumerate(STREET_NAMES):
         indices = [
             index for index, row in enumerate(recorded) if row[4] == street
@@ -191,7 +194,12 @@ def _street_rows(
             [changed[index] for index in indices],
             [shifts[index] for index in indices],
         )
-        rows.append((name, len(indices), fraction, mean_shift))
+        median_margin = (
+            float(np.median([margins[index] for index in indices]))
+            if indices
+            else float("nan")
+        )
+        rows.append((name, len(indices), fraction, mean_shift, median_margin))
     return rows
 
 
@@ -207,8 +215,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"deals         : {args.hands}   base seed {args.seed}")
     print(f"arm           : {args.arm}   iteration {args.iteration}")
     print()
-    print("                  decisions   action changes   mean |logit shift|")
-    print("                  ---------   --------------   ------------------")
+    print("                  decisions   action changes   mean |logit shift|"
+          "   median margin")
+    print("                  ---------   --------------   ------------------"
+          "   -------------")
 
     prefix = (
         args.history_prefix if args.arm == "history" else args.control_prefix
@@ -226,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
             net, encoder, env, args.hands, seed=args.seed,
             opponent_name=args.opponent,
         )
-        changed, shifts = _counterfactual(net, recorded)
+        changed, shifts, margins = _counterfactual(net, recorded)
         fraction, mean_shift = _summarise(changed, shifts)
         first = [flag for *_, flag in recorded]
         first_changed = [c for c, flag in zip(changed, first) if flag]
@@ -234,24 +244,28 @@ def main(argv: list[str] | None = None) -> int:
         first_fraction, first_shift = _summarise(first_changed, first_shifts)
         print(
             f"  seed {seed} all     {len(recorded):>9}   {fraction:>12.3%}   "
-            f"{mean_shift:>18.6f}"
+            f"{mean_shift:>18.6f}   {np.median(margins):>13.4f}"
         )
         print(
             f"  seed {seed} flop 1  {len(first_changed):>9}   "
             f"{first_fraction:>12.3%}   {first_shift:>18.6f}"
         )
-        for name, count, street_fraction, street_shift in _street_rows(
-            recorded, changed, shifts
+        for name, count, street_fraction, street_shift, margin in _street_rows(
+            recorded, changed, shifts, margins
         ):
             print(
                 f"  seed {seed} st {name:<5} {count:>7}   "
-                f"{street_fraction:>12.3%}   {street_shift:>18.6f}"
+                f"{street_fraction:>12.3%}   {street_shift:>18.6f}   "
+                f"{margin:>13.4f}"
             )
 
     print()
     print("'flop 1' is the agent's first post-flop decision, where a private")
     print("per-hand opponent coin is still hidden.")
     print("'st <name>' rows split every decision by the street it was taken on.")
+    print("'margin' is the gap between the best and second-best legal logit; small")
+    print("margins mean the greedy action is close to a tie, so a small shift flips")
+    print("it.  Compare the flip rate against that column, not on its own.")
     print("The control arm is the baseline: its weights never saw the history, so")
     print("any change there is the network's untrained sensitivity to the channel.")
     return 0
