@@ -49,14 +49,18 @@ scaffold; most of the 50-iteration training advantage was faster learning.
 
 Against a private-coin opponent -- whose hidden mode is drawn independently of
 the agent, provably absent from the observation, and still visible in the action
-record -- the same pattern appears at the same 50-iteration budget: `+0.204`
-bb/hand at training time and `+0.015` at decision time. A fork-and-replay
-**clairvoyance ceiling** settles
+record -- the same pattern appears, and it is sharper at 100 iterations.
+Training with the channel is worth `+0.204` bb/hand at 50 and `+0.146` at 100 in
+the deterministic replicate -- the gap does not shrink with more training,
+unlike Stage 3b -- and the decision-time ablation rises from `+0.015` to
+`+0.040`. But zeroing the channel still changes only `0.4 %` of the decisions
+where the coin is private. A fork-and-replay **clairvoyance ceiling** settles
 whether that gap is a limit of the information or of the optimiser. Perfect
 knowledge of the coin at the first flop decision is worth **`+1.37` bb per
 ambiguous decision (`+0.65` bb/hand over all deals)**, so the converged policy
 captures about **2 %** of what the information could buy. The hidden state is
-valuable; PPO with this architecture does not build a policy that uses it.
+valuable; PPO with this architecture uses the recurrent channel for public
+sequences, not for it.
 
 Stage 1 exists so later results are not built on guesses about RLCard's
 observations, actions, payoffs or history handling. The history encoding is data
@@ -1824,6 +1828,17 @@ iteration-50 checkpoints are **weight-identical** to the earlier runs (the file
 hashes differ only in serialisation metadata), so this is one continuous curve
 from 0 to 100.
 
+The 100-iteration runs set `OMP_NUM_THREADS=1` and `MKL_NUM_THREADS=1`, which
+makes them bit-reproducible: re-running the same configuration reproduces the
+checkpoint exactly. Thread count is not a cosmetic setting here -- the same
+10-iteration protocol under default thread counts differs from the
+single-threaded run by `max |d| = 4.2e-2` at the first trunk layer. The Stage 3b
+50-iteration runs used the same thread setting as their 100-iteration extension,
+which is why their checkpoints match bit for bit. The private-coin 50-iteration
+runs did not, so they are an independent replicate of the 100-iteration curve
+rather than its first half; the Stage 3c 50-to-100 comparison below therefore
+takes its iteration-50 point from the 100-iteration runs themselves.
+
 Reliance on the same fixed state distribution (500 deals per seed against
 `first_raiser`; "flop" is the agent's first post-flop decision, "all" is every
 recorded decision; pooled over three seeds):
@@ -2143,6 +2158,89 @@ first action is worth `+0.65` bb/hand, but PPO with this network does not build
 the mode-conditional first action. Because the continuation is held at the
 deployed policy, `+1.37` is a lower bound on a fully coin-aware policy.
 
+### Extending the private coin to 100 iterations
+
+The private-coin protocol was repeated and doubled. Six new runs (history and
+control, seeds 0/1/2) train for 100 iterations with `OMP_NUM_THREADS=1` and
+`MKL_NUM_THREADS=1`, which makes them bit-reproducible: the iteration 10-50
+checkpoints reproduce the preserved partial run exactly. The 50-iteration point
+below therefore comes from these runs themselves rather than from the earlier
+default-thread runs.
+
+Those earlier runs are effectively a second replicate at 50, and the two do not
+agree. On the paired training-opponent comparison the old replicate gives
+`+0.2039` bb/hand and the new one `-0.0056`; re-running the old matrix with the
+current code reproduces `+0.2039` exactly, so the disagreement is the training
+thread setting, not the analysis code. A single 50-iteration sample is not a
+stable baseline. The 100-iteration run is long enough for the two arms to
+separate on their own: in-run evaluation against `coin_opener`, mean over seeds,
+
+| iteration | history | control | gap |
+|---|---|---|---|
+| 50 | +0.3552 | +0.2911 | +0.0641 |
+| 100 | +0.4607 | +0.2351 | +0.2257 |
+
+and at 100 the history arm is ahead in all twelve seed x opponent cells, not
+only on the training opponent. The paired matrix (same deals, both checkpoints)
+is the cleaner measure:
+
+| iteration | `coin_opener` | `passive` | `raiser_strong` | `raiser_loose` |
+|---|---|---|---|---|
+| 50 | -0.0056 | +0.0707 | +0.1368 | +0.0904 |
+| 100 | **+0.1463** | +0.0607 | +0.0795 | +0.1355 |
+
+At 100 the four means are positive on 3/3, 2/3, 2/3 and 3/3 seeds and one seed
+is resolved on `coin_opener`; the `raiser_loose` across-seed interval is only
+`+/-0.053`. Unlike Stage 3b, the gap does not shrink with training. On the
+training opponent it grows from `-0.006` to `+0.146`, every held-out mean keeps
+its sign, and the `raiser_loose` gap widens from `+0.090` to `+0.136`.
+
+The decision-time ablation does not decay either:
+
+| iteration | `coin_opener` | `passive` | `raiser_strong` | `raiser_loose` |
+|---|---|---|---|---|
+| 50 | +0.0278 | +0.0057 | -0.0165 | +0.0297 |
+| 100 | +0.0403 | +0.0122 | -0.0480 | +0.0225 |
+
+Every cell at 100 has the same sign on all three seeds, and the training
+opponent is 3/3 positive with one seed resolved. The channel carries real
+decision-time value on the training opponent, and more of it at 100 than at 50.
+
+What it carries is still the public sequence. The reliance curve is now measured
+every 10 iterations on the same fixed state distribution (500 deals per seed
+against `coin_opener`, mean over three seeds; mean absolute logit shift when the
+channel is zeroed):
+
+| iteration | history, first flop | control, first flop | history, all | control, all |
+|---|---|---|---|---|
+| 10 | 0.35 | 0.17 | 0.71 | 0.20 |
+| 20 | 0.43 | 0.19 | 1.03 | 0.22 |
+| 30 | 0.40 | 0.17 | 1.02 | 0.21 |
+| 40 | 0.34 | 0.17 | 0.92 | 0.22 |
+| 50 | 0.38 | 0.19 | 1.05 | 0.24 |
+| 60 | 0.38 | 0.21 | 1.05 | 0.26 |
+| 70 | 0.37 | 0.21 | 1.04 | 0.27 |
+| 80 | 0.43 | 0.19 | 1.10 | 0.24 |
+| 90 | 0.36 | 0.23 | 1.00 | 0.30 |
+| 100 | 0.36 | 0.23 | 0.98 | 0.28 |
+
+The history curve is flat over the whole second half of training, at `0.34-0.43`
+for the first flop decision and `0.92-1.10` over all decisions, against control
+baselines of `0.17-0.23` and `0.20-0.30`. Turn and river shifts stay near `1.5`
+and `1.9` at both lengths. The action-flip rate falls (`1.3 %` -> `0.8 %` at the
+first flop decision) only because the policy's margins grow, from `0.44-2.38` to
+`2.78-4.08` on the river; the logit shift itself is unchanged.
+
+The probe of the final policies locates the reliance. The collision survives --
+mixed first flop decisions are `27.5 %`, `43.9 %` and `56.7 %` for seeds 0/1/2,
+with complementary responses on `28.1 %`, `43.8 %` and `61.4 %` of bot-opened
+hands -- but zeroing the channel changes `1 / 234`, `3 / 366` and `1 / 534` of
+those decisions: `0.4 %` pooled, against `1.0 %` at 50. The hidden coin is still
+ignored at the one decision where it is hidden, so the `+0.04` ablation reflects
+use of the public action sequence, not recovery of the coin. More training
+sharpened the public-sequence response (turn and river reliance) without
+building the mode-conditional first action.
+
 ### Verdict for Stage 3c
 
 The private coin was the cleanest version of the experiment available: the
@@ -2151,30 +2249,43 @@ cards and actions, and it is provably absent from the observation. The result
 is still the Stage 3 pattern, and now it cannot be blamed on the agent's own
 policy:
 
-* training with the channel is worth about `+0.20` bb/hand on the training
-  opponent (2/3 seeds resolved, wide across-seed interval);
+* training with the channel is worth `+0.204` bb/hand at 50 in the first
+  replicate and `+0.146` at 100 in the deterministic run (3/3 seeds positive at
+  100, one seed resolved);
 * the converged policy uses the channel on about `1 %` of the decisions where
-  it is informative, at the untrained baseline;
-* the ablation is `+0.015` bb/hand, unresolved on every seed;
+  it is informative, at the untrained baseline (`0.4 %` at 100);
+* the ablation is `+0.015` bb/hand at 50 and `+0.040` at 100 (3/3 seeds
+  positive, one resolved);
 * but perfect knowledge of the coin at that decision is worth `+1.37` bb per
   ambiguous decision (`+0.65` bb/hand over all deals), so the policy captures
   about `2 %` of the value the information could buy.
 
-Since the final weights do not depend on the channel, the training benefit
-cannot be an information advantage at play time. The most economical reading is
-that the recurrent pathway changes the optimisation -- it adds 16 dimensions to
-the head input and a gradient path through the token sequence -- and the
-converged greedy policy then discards it. A capacity or optimisation effect,
-not memory. The ceiling rules out the other explanation, that the coin was worth
-too little for the ablation to differ from zero: there was `+0.65` bb/hand on
-the table, and the converged policy left nearly all of it.
+Since the channel's decision-time value comes from the public action sequence
+rather than from the coin, the training benefit cannot be an information
+advantage about the hidden state. The most economical reading is that the
+recurrent pathway changes the optimisation -- it adds 16 dimensions to the head
+input and a gradient path through the token sequence -- and the converged greedy
+policy then spends almost none of it on the coin. A capacity or optimisation
+effect, not memory. The ceiling rules out the other explanation, that the coin
+was worth too little for the ablation to differ from zero: there was `+0.65`
+bb/hand on the table, and the converged policy left nearly all of it.
 
-One caveat comes from the Stage 3b extension: these are 50-iteration controls,
-and at 100 iterations the mixed-opening control closed most of the training
-gap. Part of the `+0.204` here may likewise be a head start rather than a
-permanent advantage. The ablation -- the decision-time claim -- is unaffected by
-that, but extending the private-coin runs to 100 iterations would separate the
-two readings directly.
+The 50-iteration caveat is now settled by the 100-iteration runs, and it points
+the other way. The training gap does not shrink: within the deterministic run it
+grows from `-0.006` to `+0.146` on the training opponent, with 3/3 seeds
+positive, and the held-out gaps are positive on 2-3 of three seeds each. So the
+`+0.204` measured at 50 in the first replicate was not evidence of a head start
+that longer training absorbs; if anything, the channel's training advantage
+compounds. That strengthens the optimisation reading: the recurrent pathway
+changes the trajectory, and the converged greedy policy still leaves nearly all
+of the `+0.65` bb/hand ceiling unclaimed.
+
+Two limits remain. The two 50-iteration replicates disagree in sign
+(`+0.204` vs `-0.006`), so the 50 baseline is not stable and the growth from 50
+to 100 should be read as a direction, not a measured slope. And the 100-iteration
+training gap, while 3/3 in sign, resolves on one seed only. Neither limit touches
+the decision-time claim, which is measured on identical deals and is 3/3 in sign
+with one resolved seed at 100.
 
 ### Agent A against these checkpoints
 
@@ -2257,9 +2368,10 @@ memory.
 * The encoder, the policy/value network, the rollout buffer, the PPO update and
   the training loop all exist. Agent B's network, rollout, PPO updater, training
   loop, checkpointing, paired comparison and history-reliance diagnostic are
-  implemented, tested and exercised on twenty-seven runs (the six original
-  runs, the nine Stage 3 runs, the six pre-flop-entropy runs and the six
-  100-iteration mixed-opening runs).
+  implemented, tested and exercised on thirty-nine runs (the six original
+  runs, the nine Stage 3 runs, the six pre-flop-entropy runs, the six
+  100-iteration mixed-opening runs, the six private-coin runs and their six
+  single-threaded 100-iteration repeats).
 * Agent B's comparison is confounded slightly by capacity: B has `+15.9 %` more
   parameters than A. The control arm (same capacity, no history input) removes
   that confound for the "memory vs no memory" question, but the headline A-vs-B
@@ -2281,6 +2393,14 @@ memory.
   the control catches up is supported by the 3-5x drop from 50 and by the
   absolute held-out evaluations, not by a significant interaction. More seeds
   or more hands would be needed to say whether a small permanent edge remains.
+* **Thread count changes the run.** The 100-iteration Stage 3b and Stage 3c
+  runs are single-threaded and bit-reproducible; the earlier 50-iteration
+  private-coin runs used default thread counts, and the same 10-iteration
+  protocol differs by `max |d| = 4.2e-2` at the first trunk layer between the two
+  settings. The two 50-iteration private-coin replicates therefore disagree in
+  sign (`+0.204` vs `-0.006`) without either being a bug. Comparisons are only
+  made within one thread setting; the Stage 3c 50-to-100 comparison uses the
+  100-iteration runs' own iteration-50 checkpoints.
 * **The hidden-mode opponent is imperfect.** `FirstRaiserBettor` can misclassify
   itself as the first raiser when it re-raises after the agent opened, so its
   intended post-flop mode is not always realized (`70.7 %` bet rate in mode 1).
@@ -2290,9 +2410,11 @@ memory.
   state only occurs when the agent calls a bot raise and raises a bot call. A
   policy that opens both lines itself reveals the coin through the chips. The
   probe measures the realised rate on the trained policies rather than assuming
-  it: after training, `51.7-52.5 %` of first flop decisions are still ambiguous
-  and `52.9-55.0 %` of bot-opened hands are still complementary, so the test is
-  not vacuous.
+  it: after 50 iterations, `51.7-52.5 %` of first flop decisions are still
+  ambiguous and `52.9-55.0 %` of bot-opened hands are still complementary; after
+  100 the ranges are `27.5-56.7 %` and `28.1-61.4 %`, so the test is not
+  vacuous, but seed 0's collision is thinning as the policy grows more
+  confident.
 * **The clairvoyance ceiling is a one-decision oracle.** It values the first
   flop action with the coin known while holding the deployed continuation
   fixed, so it is a lower bound on a fully coin-aware policy. It covers the
@@ -2334,6 +2456,7 @@ memory.
 | 8 | Train history/control against the private coin | ✅ done — `+0.204` bb/hand at training time (2/3 seeds resolved), `+0.015` ablation (0/3), 1.2 % reliance at the hidden decision vs 0.5 % control |
 | 9 | Clairvoyance ceiling on the private coin | ✅ done — perfect knowledge of the coin is worth `+1.37` bb per ambiguous decision (`+0.65` bb/hand over all deals); the policy captures about 2 % |
 | 10 | Extend the mixed-opening runs to 100 iterations and test whether reliance decays | ✅ done — reliance is flat from iteration 10 to 100 (`~0.6` flop, `~1.0` all-decision logit shift vs `0.2-0.3` control); the ablation holds at `+0.045`, while the training-time gap shrinks from `+0.236` to `+0.055` as the control catches up |
+| 11 | Extend the private-coin runs to 100 iterations, single-threaded, and measure the full reliance curve | ✅ done — the training gap grows from `-0.006` to `+0.146` (3/3 seeds positive, 1 resolved) and the ablation from `+0.028` to `+0.040` (3/3); reliance is flat and the coin is still ignored at the private decision (`0.4 %` flips) |
 
 **Verdict: memory is a permanent decision-time input when the opening is
 genuinely mixed, and none of the mixed-opening advantage is a lasting
@@ -2353,24 +2476,28 @@ fall. So the channel is used, and stays used; most of the 50-iteration gap was
 faster learning. Three seeds and a soft sampled break bound the claim.
 
 The private-coin experiment removes the agent's own opening from the
-confound and adds the ceiling. At the same 50-iteration budget, training with
-the channel is worth `+0.204`
-bb/hand, the ablation is `+0.015`, and perfect knowledge of the coin at the first
-flop decision is worth `+0.651` bb/hand. The information was there and valuable;
-the converged policy used about 2 % of it. That is the cleanest evidence that
-the recurrent channel acts on PPO's optimisation, not on the deployed policy.
+confound and adds the ceiling. At 50 iterations training with the channel is
+worth `+0.204` bb/hand and the ablation `+0.015`; at 100 the deterministic
+replicate gives `+0.146` and `+0.040`, with the gap growing rather than
+shrinking. The ablation's value comes from the public sequence: zeroing the
+channel changes only `0.4 %` of the decisions where the coin is private. Perfect
+knowledge of the coin at the first flop decision is worth `+0.651` bb/hand. The
+information was there and valuable; the converged policy used about 2 % of it.
+That is the cleanest evidence that the recurrent channel acts on PPO's
+optimisation, not on the deployed policy's information.
 
 **Measured: the coin is worth `+0.65` bb/hand and the policy captures 2 %.**
 Stage 3c's `+0.015` ablation was consistent with two stories -- the information
 was worthless, or the policy could not use it. The ceiling separates them, and it
 came in far above the `0.01-0.03` bb/hand that would have settled the project in
 memory's favour. The next cheap question is therefore about optimisation, not
-opponents. The 100-iteration test has now ruled out the decay explanation for
-Stage 3b: reliance is flat, so the mixed-opening channel is not being absorbed
-and the remaining question is why it is worth only `+0.045` when a perfect
-signal is worth `+0.65`. The natural follow-up is an auxiliary head that
-predicts the hidden mode, or more capacity, both of which change the research
-question from "does memory help?" to "what supervision makes memory help?".
+opponents. The 100-iteration tests have now ruled out the decay explanation for
+both stages: reliance is flat, and the private-coin training gap grows rather
+than shrinks. The remaining question is why the channel is worth only `+0.040`
+when a perfect signal is worth `+0.65`. The natural follow-up is an auxiliary
+head that predicts the hidden mode, or more capacity, both of which change the
+research question from "does memory help?" to "what supervision makes memory
+help?".
 
 A sensible remaining Stage 2 scope:
 
@@ -2454,6 +2581,12 @@ A sensible remaining Stage 2 scope:
 22. ~~Extend the mixed-opening history/control runs to 100 iterations and test
     whether the reliance decay is permanent.~~ ✅ Reliance is flat from 10 to
     100 (logit shift `~0.6`/`~1.0` against a `0.2-0.3` control); the ablation
-    holds at `+0.045` while the training gap falls to `+0.055`. Next: extend
-    the private-coin runs to 100 iterations, then try an auxiliary mode-prediction
-    head or more capacity.
+    holds at `+0.045` while the training gap falls to `+0.055`.
+23. ~~Extend the private-coin runs to 100 iterations, single-threaded, and
+    measure the reliance curve at every checkpoint.~~ ✅ Six runs. The 50-to-100
+    comparison uses their own iteration-50 checkpoints because the earlier
+    default-thread runs are an independent replicate. The training gap grows
+    from `-0.006` to `+0.146` (3/3 seeds positive, 1 resolved) and the ablation
+    from `+0.028` to `+0.040` (3/3); reliance is flat from 20 to 100, and the
+    probe still flips only `0.4 %` of private-coin decisions. Next: an auxiliary
+    mode-prediction head or more capacity.
