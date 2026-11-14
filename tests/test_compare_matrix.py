@@ -46,6 +46,20 @@ def test_checkpoint_names_follow_custom_prefixes(tmp_path):
     assert control.name == "agent_b_coin_control_seed2_0050.pt"
 
 
+def test_checkpoint_names_follow_the_requested_iteration(tmp_path):
+    history, control = compare_matrix._checkpoint_paths(
+        "history-vs-control", 1, tmp_path, iteration=100
+    )
+    assert history.name == "agent_b_seed1_0100.pt"
+    assert control.name == "agent_b_control_seed1_0100.pt"
+
+    on, off = compare_matrix._checkpoint_paths(
+        "ablation", 0, tmp_path, iteration=30
+    )
+    assert on.name == "agent_b_seed0_0030.pt"
+    assert on == off
+
+
 def test_unknown_mode_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="unknown mode"):
         compare_matrix._checkpoint_paths("nonsense", 0, tmp_path)

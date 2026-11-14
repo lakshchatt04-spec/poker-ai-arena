@@ -29,6 +29,7 @@ Usage::
 
     python scripts\\compare_matrix.py --hands 2000
     python scripts\\compare_matrix.py --hands 2000 --out runs\\b_matrix.md
+    python scripts\\compare_matrix.py --iteration 100 --modes history-vs-control ablation
 """
 
 from __future__ import annotations
@@ -93,6 +94,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="run-name prefix of the control arm (default: agent_b_control)",
     )
     parser.add_argument(
+        "--iteration", type=int, default=50,
+        help="checkpoint iteration to compare (default: 50)",
+    )
+    parser.add_argument(
         "--seed-base", type=int, default=10_000,
         help="base deal seed; hand h uses seed + h (default: 10000)",
     )
@@ -114,12 +119,14 @@ def _checkpoint_paths(
     *,
     history_prefix: str = "agent_b",
     control_prefix: str = "agent_b_control",
+    iteration: int = 50,
 ) -> tuple[Path, Path]:
-    history = directory / f"{history_prefix}_seed{seed}_0050.pt"
+    suffix = f"_{iteration:04d}.pt"
+    history = directory / f"{history_prefix}_seed{seed}{suffix}"
     if mode == "history-vs-control":
-        return history, directory / f"{control_prefix}_seed{seed}_0050.pt"
+        return history, directory / f"{control_prefix}_seed{seed}{suffix}"
     if mode == "agent-a-vs-b":
-        return directory / f"agent_a_seed{seed}_0050.pt", history
+        return directory / f"agent_a_seed{seed}{suffix}", history
     if mode == "ablation":
         return history, history
     raise ValueError(f"unknown mode {mode!r}")
@@ -174,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
     csv_rows: list[str] = ["mode,opponent,seed,mean_difference_bb,ci95_bb,hands"]
 
     for mode in args.modes:
-        lines.append(f"## {mode}")
+        lines.append(f"## {mode} @ iteration {args.iteration}")
         lines.append("")
         lines.append("| opponent | seed | first - second | 95 % | resolved |")
         lines.append("|---|---|---|---|---|")
@@ -186,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
                     mode, seed, directory,
                     history_prefix=args.history_prefix,
                     control_prefix=args.control_prefix,
+                    iteration=args.iteration,
                 )
                 built = _policies(mode, first, second, encoder)
                 if built is None:
