@@ -91,7 +91,7 @@ def _record_states(net, encoder, env, hands, *, seed, opponent_name):
 
     tracker = HistoryTracker()
     recorded: list[
-        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]
+        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, bool]
     ] = []
 
     with torch.no_grad():
@@ -120,6 +120,7 @@ def _record_states(net, encoder, env, hands, *, seed, opponent_name):
                             sequence.tokens,
                             sequence.mask,
                             encoded.legal_mask,
+                            street,
                             street > 0 and postflop_decisions == 0,
                         )
                     )
@@ -148,7 +149,7 @@ def _counterfactual(net, recorded):
     changed: list[bool] = []
     shifts: list[float] = []
     with torch.no_grad():
-        for features, tokens, mask, legal, _ in recorded:
+        for features, tokens, mask, legal, *_ in recorded:
             batch = (
                 torch.from_numpy(features).unsqueeze(0),
                 torch.from_numpy(tokens).unsqueeze(0),
@@ -171,6 +172,27 @@ def _summarise(changed: list[bool], shifts: list[float]) -> tuple[float, float]:
     if not changed:
         return float("nan"), float("nan")
     return float(np.mean(changed)), float(np.mean(shifts))
+
+
+STREET_NAMES = ("preflop", "flop", "turn", "river")
+
+
+def _street_rows(
+    recorded, changed, shifts
+) -> list[tuple[str, int, float, float]]:
+    """Group the counterfactual by the street each decision was taken on."""
+
+    rows: list[tuple[str, int, float, float]] = []
+    for street, name in enumerate(STREET_NAMES):
+        indices = [
+            index for index, row in enumerate(recorded) if row[4] == street
+        ]
+        fraction, mean_shift = _summarise(
+            [changed[index] for index in indices],
+            [shifts[index] for index in indices],
+        )
+        rows.append((name, len(indices), fraction, mean_shift))
+    return rows
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -218,10 +240,18 @@ def main(argv: list[str] | None = None) -> int:
             f"  seed {seed} flop 1  {len(first_changed):>9}   "
             f"{first_fraction:>12.3%}   {first_shift:>18.6f}"
         )
+        for name, count, street_fraction, street_shift in _street_rows(
+            recorded, changed, shifts
+        ):
+            print(
+                f"  seed {seed} st {name:<5} {count:>7}   "
+                f"{street_fraction:>12.3%}   {street_shift:>18.6f}"
+            )
 
     print()
     print("'flop 1' is the agent's first post-flop decision, where a private")
     print("per-hand opponent coin is still hidden.")
+    print("'st <name>' rows split every decision by the street it was taken on.")
     print("The control arm is the baseline: its weights never saw the history, so")
     print("any change there is the network's untrained sensitivity to the channel.")
     return 0
