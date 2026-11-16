@@ -2,7 +2,48 @@
 
 Heads-up Limit Texas Hold'em as a controlled testbed for reinforcement learning.
 
-Two agents will eventually be trained with PPO and compared:
+An end-to-end PPO implementation — no RL framework — built to answer one
+falsifiable question with counted evidence instead of anecdote: **does a
+recurrent memory of the opponent's actions help a reinforcement-learning agent
+at poker?**
+
+## At a glance
+
+| | |
+|---|---|
+| **What it is** | RLCard environment → 131-feature observation encoder → PPO trainer → paired, fixed-deal evaluation harness, with two agents and a capacity-matched control |
+| **Agents** | **A:** 100,869-parameter MLP over the current state. **B:** 116,933-parameter MLP + GRU over the betting history |
+| **Headline result** | Against a bot whose play depends on history the observation cannot recover, memory is worth **`+0.236` bb/hand** over the capacity-matched control — but a within-checkpoint ablation and a clairvoyance ceiling show the converged policy captures only **~2 %** of the information's value |
+| **Stack** | Python 3.14, PyTorch, NumPy, RLCard, matplotlib; pytest for the suite |
+| **Scale** | ~12,500 lines across 46 Python modules · 39 training runs · three seeds per arm · 2,000 paired deals per comparison cell |
+| **Tests** | `294 passed` — simulator contract, encoder bounds, action masking, GAE identities, PPO invariants, checkpoint round-trips, bit-reproducibility |
+
+## What this demonstrates
+
+* **Deep RL from scratch.** Clipped PPO with GAE, advantage and return
+  normalisation, entropy control and gradient-norm clipping, written directly
+  against the algorithm rather than through an RL library.
+* **Experiment design under noise.** Every comparison is paired on identical
+  seeded deals, quoted with 95 % intervals, and run against a capacity-matched
+  control arm so a result cannot be explained by "the network got bigger".
+* **Pre-registered identifiability checks.** Before any training compute is
+  spent, a probe measures whether the opponent's hidden variable is recoverable
+  from the observation at all. One drafted opponent was rejected this way.
+* **Finding and fixing real bugs.** The most useful results in the project are
+  simulator and measurement bugs, each reproduced, fixed, and pinned by a test —
+  including a silent illegal-action substitution that made a policy fold when it
+  thought it was raising, and stale state leaking the previous hand's raise
+  counts into the opening observation.
+
+## Reading paths
+
+* **60 seconds:** this section and [Results in brief](#results-in-brief).
+* **Engineering:** [Setup](#setup), [PPO update](#ppo-update),
+  [Known pitfalls](#known-pitfalls).
+* **Research:** [Stage 3c: a private coin](#stage-3c-a-private-coin) and
+  [what perfect knowledge of the coin would have been worth](#what-perfect-knowledge-of-the-coin-would-have-been-worth).
+
+Two agents are trained with PPO and compared:
 
 | | Agent A | Agent B |
 |---|---|---|
@@ -13,7 +54,9 @@ Two agents will eventually be trained with PPO and compared:
 **Research question:** *Does recurrent memory of opponent actions improve
 reinforcement-learning performance in heads-up poker?*
 
-**Current stage: complete through the original five stages, plus the
+## Results in brief
+
+**Status: complete through the original five stages, plus the
 mixed-opening and private-coin follow-ups (roadmap rows 6-10), with a qualified
 answer to the research question.** Against the original memoryless scripted opponents, memory
 does not pay: training with the channel was worth `+0.007` to `+0.020` bb/hand
@@ -48,19 +91,20 @@ iteration 10 to 100. The channel is a **permanent decision-time input**, not a
 scaffold; most of the 50-iteration training advantage was faster learning.
 
 Against a private-coin opponent -- whose hidden mode is drawn independently of
-the agent, provably absent from the observation, and still visible in the action
-record -- the same pattern appears, and it is sharper at 100 iterations.
-Training with the channel is worth `+0.204` bb/hand at 50 and `+0.146` at 100 in
-the deterministic replicate -- the gap does not shrink with more training,
-unlike Stage 3b -- and the decision-time ablation rises from `+0.015` to
-`+0.040`. But zeroing the channel still changes only `0.4 %` of the decisions
-where the coin is private. A fork-and-replay **clairvoyance ceiling** settles
-whether that gap is a limit of the information or of the optimiser. Perfect
-knowledge of the coin at the first flop decision is worth **`+1.37` bb per
-ambiguous decision (`+0.65` bb/hand over all deals)**, so the converged policy
-captures about **2 %** of what the information could buy. The hidden state is
-valuable; PPO with this architecture uses the recurrent channel for public
-sequences, not for it.
+the deal, provably absent from the public betting summary, and still visible in
+the action record -- the same pattern appears, and it is sharper at 100
+iterations. Training with the channel is worth `+0.204` bb/hand at 50 and
+`+0.146` at 100 in the deterministic replicate -- the gap does not shrink with
+more training, unlike Stage 3b -- and the decision-time ablation rises from
+`+0.015` to `+0.040`. But zeroing the channel still changes only `0.4 %` of the
+decisions where the coin is private, and `0.5 %` on the stricter subset whose
+hole cards give no strong within-summary ranking. A fork-and-replay
+**clairvoyance ceiling** settles whether that gap is a limit of the information
+or of the optimiser. Perfect knowledge of the coin at the first flop decision is
+worth **`+1.37` bb per ambiguous decision (`+0.65` bb/hand over all deals)**, so
+the converged policy captures about **2 %** of what the information could buy.
+The hidden state is valuable; PPO with this architecture uses the recurrent
+channel for public sequences, not for it.
 
 Stage 1 exists so later results are not built on guesses about RLCard's
 observations, actions, payoffs or history handling. The history encoding is data
@@ -244,7 +288,7 @@ smoke test with `All history-encoding checks passed.`, the encoder report with
 `All network checks passed.`, the rollout report with
 `All rollout checks passed.`, the PPO report with `All PPO checks passed.`, the
 Agent B report with `All Agent B network checks passed.`, and the test suite
-currently reports `204 passed`.
+currently reports `294 passed`.
 
 `pytest.ini` limits collection to `tests/` because
 `scripts/test_environment.py` and `tests/test_environment.py` share a filename
@@ -1354,7 +1398,7 @@ python scripts\compare_agents.py `
   --ablate --opponent raiser_loose
 ```
 
-The planned experiment is three seeds of the history arm and three seeds of the
+The experiment ran three seeds of the history arm and three seeds of the
 control arm, paired per seed, plus the within-checkpoint ablation.
 `scripts/compare_matrix.py` runs that whole matrix (3 modes x 3 seeds x 3
 opponents) in one process and writes a markdown table.
@@ -2107,7 +2151,12 @@ the mixed groups the policy bets on `14.9 %` of mode-0 decisions and `0.0 %` of
 mode-1 decisions (seed 0). That is **not** memory use. The complementary
 pre-flop response is a raise in one mode and a call in the other, so the two
 mode subsets contain different card ranges: mode 0 selects the hands the policy
-raised with. Only the counterfactual above holds the cards fixed.
+raised with. The counterfactual holds the cards fixed *within* a state, but the
+pool of states is still selected across modes by the agent's cards. The
+100-iteration probe measures that selection directly (see [Extending the private
+coin to 100
+iterations](#extending-the-private-coin-to-100-iterations)); the channel is
+still unused where the cards give no strong within-summary signal.
 
 ### What perfect knowledge of the coin would have been worth
 
@@ -2235,25 +2284,66 @@ The probe of the final policies locates the reliance. The collision survives --
 mixed first flop decisions are `27.5 %`, `43.9 %` and `56.7 %` for seeds 0/1/2,
 with complementary responses on `28.1 %`, `43.8 %` and `61.4 %` of bot-opened
 hands -- but zeroing the channel changes `1 / 234`, `3 / 366` and `1 / 534` of
-those decisions: `0.4 %` pooled, against `1.0 %` at 50. The hidden coin is still
-ignored at the one decision where it is hidden, so the `+0.04` ablation reflects
-use of the public action sequence, not recovery of the coin. More training
-sharpened the public-sequence response (turn and river reliance) without
-building the mode-conditional first action.
+those decisions: `0.4 %` pooled, against `1.0 %` at 50. The public summary is
+genuinely blind at that decision, so the `+0.04` ablation reflects use of the
+public action sequence, not recovery of the coin. More training sharpened the
+public-sequence response (turn and river reliance) without building the
+mode-conditional first action.
+
+### The hole cards are not blind, and the channel is still unused
+
+The public summary is blind, but the observation is not quite free of the coin.
+The agent's own pre-flop policy is card-based, so the hands that reach a mixed
+state differ by coin: after a bot raise the agent calls, after a bot call it
+raises, and it selects different ranges for those two actions. A logistic model
+on the hole cards alone, fitted on the first 75 % of deals and scored on the
+rest, ranks the coin inside a shared summary at
+
+| iteration | seed 0 | seed 1 | seed 2 |
+|---|---|---|---|
+| 50 | 0.624 (p=0.045) | 0.750 (p=0.005) | 0.683 (p=0.015) |
+| 100 | 0.879 (p=0.005) | 0.768 (p=0.005) | 0.677 (p=0.005) |
+
+with 282-1,722 same-summary pairs per cell and 0.5 meaning the cards are
+blind. The scripted `complement` probe had no such leak (cards only `50.8 %`
+against a `50.8 %` baseline) because that agent ignores its cards; the trained
+policy creates the leak through range selection. So the coin is independent of
+the deal but not independent of the observation at the decision, and the pooled
+flip rate is measured over a card-selected pool.
+
+The clean test keeps only the states whose hole-card score is near its
+summary's midpoint, `|within-group hole-card z| <= 0.5`:
+
+| iteration | mixed decisions | card-ambiguous subset | flips on the subset |
+|---|---|---|---|
+| 50 | 1,258 | 515 (40.9 %) | 5 (1.0 %) |
+| 100 | 1,134 | 420 (37.0 %) | 2 (0.5 %) |
+
+The per-seed 100-iteration counts are `1 / 83`, `0 / 132` and `1 / 205`. That is
+the same rate as the pooled pool (`5 / 1,134`, `0.4 %`), so the few flips are not
+concentrated in the card-identifiable states: where the cards supply no strong
+evidence, zeroing the channel still changes the greedy action at roughly one
+decision in two hundred. Restricting to the card-ambiguous states therefore does
+not revive the coin. It does show that the earlier phrasing -- that the coin is
+ignored at the one decision where it is hidden -- was too strong: the card-free
+summary hides it, but the agent's own cards carry information about it, and the
+subset test is the claim that survives.
 
 ### Verdict for Stage 3c
 
 The private coin was the cleanest version of the experiment available: the
-hidden state is drawn from the bot's own RNG, it is independent of the agent's
-cards and actions, and it is provably absent from the observation. The result
-is still the Stage 3 pattern, and now it cannot be blamed on the agent's own
-policy:
+hidden state is drawn from the bot's own RNG independently of the deal, and the
+public betting summary contains no information about it. The agent's card-based
+pre-flop selection does make the two coin branches hold different ranges, so
+"hidden" is enforced on the public summary and then tested directly on the
+card-blind subset. Even there the result is the Stage 3 pattern:
 
 * training with the channel is worth `+0.204` bb/hand at 50 in the first
   replicate and `+0.146` at 100 in the deterministic run (3/3 seeds positive at
   100, one seed resolved);
-* the converged policy uses the channel on about `1 %` of the decisions where
-  it is informative, at the untrained baseline (`0.4 %` at 100);
+* the converged policy uses the channel on about `0.4 %` of the decisions where
+  it is informative at 100 (`1.0 %` at 50), including `0.5 %` on the
+  card-ambiguous subset where the hole cards give no strong ranking;
 * the ablation is `+0.015` bb/hand at 50 and `+0.040` at 100 (3/3 seeds
   positive, one resolved);
 * but perfect knowledge of the coin at that decision is worth `+1.37` bb per
@@ -2261,8 +2351,10 @@ policy:
   about `2 %` of the value the information could buy.
 
 Since the channel's decision-time value comes from the public action sequence
-rather than from the coin, the training benefit cannot be an information
-advantage about the hidden state. The most economical reading is that the
+rather than from the coin -- and the card-ambiguous subset reproduces the same
+~0.5 % flip rate, so the small number of flips cannot be credited to the cards
+either -- the training benefit cannot be an information advantage about the
+hidden state. The most economical reading is that the
 recurrent pathway changes the optimisation -- it adds 16 dimensions to the head
 input and a gradient path through the token sequence -- and the converged greedy
 policy then spends almost none of it on the coin. A capacity or optimisation
@@ -2415,6 +2507,15 @@ memory.
   100 the ranges are `27.5-56.7 %` and `28.1-61.4 %`, so the test is not
   vacuous, but seed 0's collision is thinning as the policy grows more
   confident.
+* **The coin is not fully hidden from the trained agent's observation.** The
+  card-based pre-flop opening selects different ranges into the two coin
+  branches, so within a shared betting summary the agent's hole cards rank the
+  coin at AUC `0.62-0.75` at 50 and `0.68-0.88` at 100 (`p <= 0.045`). The probe
+  now repeats the counterfactual on the card-ambiguous subset (`|within-group
+  z| <= 0.5`) and finds the same ~`0.5 %` flip rate, so the "deaf to the coin"
+  reading survives; but the pooled flip rate alone would not establish it,
+  because part of the natural state mix already reveals the coin through the
+  cards.
 * **The clairvoyance ceiling is a one-decision oracle.** It values the first
   flop action with the coin known while holding the deployed continuation
   fixed, so it is a lower bound on a fully coin-aware policy. It covers the
@@ -2588,5 +2689,7 @@ A sensible remaining Stage 2 scope:
     default-thread runs are an independent replicate. The training gap grows
     from `-0.006` to `+0.146` (3/3 seeds positive, 1 resolved) and the ablation
     from `+0.028` to `+0.040` (3/3); reliance is flat from 20 to 100, and the
-    probe still flips only `0.4 %` of private-coin decisions. Next: an auxiliary
-    mode-prediction head or more capacity.
+    probe still flips only `0.4 %` of private-coin decisions (`0.5 %` on the
+    card-ambiguous subset, where the hole cards give no strong ranking; the
+    cards themselves leak the coin at within-summary AUC `0.68-0.88`). Next: an
+    auxiliary mode-prediction head or more capacity.

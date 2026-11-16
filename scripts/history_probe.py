@@ -48,7 +48,10 @@ Protocol:
    so a non-zero difference is the agent acting on the history tokens.  A probe
    agent that ignores the coin scores zero even when the mode is perfectly
    recoverable, which separates "the memory carries the coin" from "the policy
-   uses the memory".
+   uses the memory".  The agent's complementary pre-flop response can still
+   select different card ranges per mode, so repeat the counterfactual (history
+   on versus off) on the subset whose hole cards give no strong within-summary
+   ranking.  A flip there cannot be explained by the cards.
 
 Reading: features-only near the majority baseline (and cards-only at the
 mixed-group baseline) means the mode is genuinely hidden and the training
@@ -79,6 +82,7 @@ import torch
 
 from poker_arena.encoding import (
     FEATURE_DIM,
+    HOLE_SLICE,
     RAISE_SLICE,
     ObservationEncoder,
     small_blind_player,
@@ -131,6 +135,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--epochs", type=int, default=400,
         help="full-batch logistic-regression epochs (default: 400)",
+    )
+    parser.add_argument(
+        "--card-ambiguous-z", type=float, default=0.5,
+        help=(
+            "within-group hole-card z-score cut for the card-ambiguous flip "
+            "test (default: 0.5)"
+        ),
     )
     parser.add_argument(
         "--out", default=None,
@@ -355,20 +366,19 @@ def _identifiability(
     )
 
 
-def _fit_logistic(
+def _fit_scores(
     x_train: np.ndarray,
     y_train: np.ndarray,
     x_test: np.ndarray,
-    y_test: np.ndarray,
     *,
     seed: int = 0,
     epochs: int = 400,
     learning_rate: float = 0.05,
-) -> float:
-    """Fit a standardised logistic model and return its test accuracy."""
+) -> np.ndarray | None:
+    """Fit a standardised logistic model and return its test logits."""
 
     if x_train.size == 0 or x_test.size == 0 or y_train.size == 0:
-        return float("nan")
+        return None
 
     mean = x_train.mean(axis=0)
     std = x_train.std(axis=0)
@@ -377,7 +387,6 @@ def _fit_logistic(
     xt = torch.from_numpy(((x_train - mean) / std).astype(np.float32))
     xs = torch.from_numpy(((x_test - mean) / std).astype(np.float32))
     yt = torch.from_numpy(y_train.astype(np.float32)).unsqueeze(1)
-    ys = torch.from_numpy(y_test.astype(np.float32)).unsqueeze(1)
 
     torch.manual_seed(seed)
     model = torch.nn.Linear(xt.shape[1], 1)
@@ -395,8 +404,123 @@ def _fit_logistic(
 
     model.eval()
     with torch.no_grad():
-        predictions = (model(xs) > 0).float()
-    return float((predictions == ys).float().mean())
+        return model(xs).squeeze(1).numpy()
+
+
+def _fit_logistic(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_test: np.ndarray,
+    y_test: np.ndarray,
+    *,
+    seed: int = 0,
+    epochs: int = 400,
+    learning_rate: float = 0.05,
+) -> float:
+    """Fit a standardised logistic model and return its test accuracy."""
+
+    scores = _fit_scores(
+        x_train,
+        y_train,
+        x_test,
+        seed=seed,
+        epochs=epochs,
+        learning_rate=learning_rate,
+    )
+    if scores is None:
+        return float("nan")
+    return float(((scores > 0).astype(np.float32) == y_test).mean())
+
+
+def _within_group_auc(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    keys: list[bytes],
+    *,
+    permutations: int = 200,
+    seed: int = 0,
+) -> tuple[float, int, int, float]:
+    """AUC of ``scores`` inside each shared-summary group.
+
+    A global threshold can miscalibrate across summaries, so accuracy against a
+    majority baseline is ambiguous: the summary term can supply the group bias
+    and the cards can do the rest. This statistic asks the sharper question --
+    within one summary, do the cards rank mode-1 states above mode-0 states?
+    The null shuffles labels inside each group, which is the only exchangeability
+    the no-leak hypothesis allows.
+    """
+
+    grouped: dict[bytes, tuple[list[float], list[float]]] = defaultdict(
+        lambda: ([], [])
+    )
+    for score, label, key in zip(scores, labels, keys):
+        grouped[key][int(label)].append(float(score))
+
+    def _wins(pairs: dict[bytes, tuple[list[float], list[float]]]) -> float:
+        total = 0.0
+        for zeros, ones in pairs.values():
+            if not zeros or not ones:
+                continue
+            diff = np.asarray(ones)[:, None] - np.asarray(zeros)[None, :]
+            total += float((diff > 0).sum()) + 0.5 * float((diff == 0).sum())
+        return total
+
+    pairs = 0
+    groups = 0
+    for zeros, ones in grouped.values():
+        if zeros and ones:
+            groups += 1
+            pairs += len(zeros) * len(ones)
+    if pairs == 0:
+        return float("nan"), 0, 0, 1.0
+
+    observed = _wins(grouped) / pairs
+    rng = np.random.default_rng(seed)
+    null = np.empty(int(permutations))
+    for index in range(int(permutations)):
+        shuffled: dict[bytes, tuple[list[float], list[float]]] = {}
+        for key, (zeros, ones) in grouped.items():
+            values = np.asarray(zeros + ones)
+            order = rng.permutation(values.size)
+            cut = len(zeros)
+            shuffled[key] = (
+                list(values[order[:cut]]),
+                list(values[order[cut:]]),
+            )
+        null[index] = _wins(shuffled) / pairs
+    p_value = (1.0 + float((null >= observed).sum())) / (1.0 + permutations)
+    return observed, pairs, groups, p_value
+
+
+def _within_group_z(scores: np.ndarray, keys: list[bytes]) -> np.ndarray:
+    """Standardise scores inside each shared-summary group.
+
+    A single logistic fit shares one intercept across summaries, so its raw
+    output mixes each group's preference with the card evidence.  Removing the
+    group's own mean and spread leaves only the within-summary card signal.
+    A group with no spread gets zeros: its cards carry no evidence either way,
+    so those states count as card-ambiguous rather than being dropped.
+    """
+
+    members: dict[bytes, list[int]] = defaultdict(list)
+    for index, key in enumerate(keys):
+        members[key].append(index)
+
+    z = np.zeros(scores.size, dtype=np.float64)
+    for indices in members.values():
+        values = np.asarray([scores[i] for i in indices], dtype=np.float64)
+        spread = float(values.std())
+        if spread > 1e-9:
+            z[indices] = (values - values.mean()) / spread
+    return z
+
+
+def _card_ambiguous(
+    scores: np.ndarray, keys: list[bytes], threshold: float
+) -> np.ndarray:
+    """Mask the states whose cards give no strong within-summary ranking."""
+
+    return np.abs(_within_group_z(scores, keys)) <= float(threshold)
 
 
 def _report(args: argparse.Namespace, data: dict[str, np.ndarray]) -> str:
@@ -552,6 +676,28 @@ def _report(args: argparse.Namespace, data: dict[str, np.ndarray]) -> str:
         lines.append(
             f"   mixed groups, cards only : {cards_mixed:.1%}"
         )
+        hole_scores = _fit_scores(
+            features[train_mask][:, HOLE_SLICE],
+            labels[train_mask],
+            features[mixed_test][:, HOLE_SLICE],
+            epochs=args.epochs,
+        )
+        if hole_scores is not None:
+            mixed_key_list = [
+                key for key, keep in zip(keys, mixed_test) if keep
+            ]
+            auc, pairs, groups, p_value = _within_group_auc(
+                hole_scores, labels[mixed_test], mixed_key_list
+            )
+            lines.append(
+                f"   hole cards, within-group AUC: {auc:.3f} "
+                f"({pairs} same-summary pairs, {groups} groups, "
+                f"shuffle p={p_value:.3f})"
+            )
+            lines.append(
+                "     0.5 = cards cannot tell the modes apart inside a "
+                "summary; 1.0 = they separate it perfectly"
+            )
         lines.append("")
 
     first = data["first_postflop"]
@@ -614,15 +760,74 @@ def _report(args: argparse.Namespace, data: dict[str, np.ndarray]) -> str:
                 "     same state, same cards, same features: only the token"
             )
             lines.append(
-                "     stream differs, so this is the clean decision-time test"
+                "     stream differs. States are still card-selected across"
             )
+            lines.append(
+                "     modes, so the card-ambiguous subset below is the clean test"
+            )
+            mixed_keys_all = [key for key, keep in zip(keys, in_mixed) if keep]
+            mixed_hole_scores = _fit_scores(
+                features[train_mask][:, HOLE_SLICE],
+                labels[train_mask],
+                features[in_mixed][:, HOLE_SLICE],
+                epochs=args.epochs,
+            )
+            if mixed_hole_scores is not None:
+                ambiguous = _card_ambiguous(
+                    mixed_hole_scores, mixed_keys_all, args.card_ambiguous_z
+                )
+                ambiguous_full = np.zeros(labels.size, dtype=bool)
+                ambiguous_full[in_mixed] = ambiguous
+                total = int(ambiguous_full.sum())
+                lines.append(
+                    f"   card-ambiguous subset (|within-group hole-card z| "
+                    f"<= {args.card_ambiguous_z:.2f}): "
+                    f"{total} of {int(in_mixed.sum())} mixed decisions"
+                )
+                if total:
+                    flipped = int(
+                        (ambiguous_full & (actions_off != actions)).sum()
+                    )
+                    zero = int((ambiguous_full & mode0).sum())
+                    one = int((ambiguous_full & mode1).sum())
+                    changed_zero = int(
+                        (ambiguous_full & mode0 & (actions_off != actions)).sum()
+                    )
+                    changed_one = int(
+                        (ambiguous_full & mode1 & (actions_off != actions)).sum()
+                    )
+                    lines.append(
+                        f"     hole cards give no strong within-summary "
+                        f"ranking here"
+                    )
+                    lines.append(
+                        f"     history on/off flips: {flipped} of {total} "
+                        f"({flipped / total:.1%})"
+                    )
+                    lines.append(
+                        f"     mode 0: {changed_zero} of {zero}"
+                        f"   mode 1: {changed_one} of {one}"
+                    )
+                else:
+                    lines.append(
+                        "     none: every mixed decision has cards that rank "
+                        "the modes"
+                    )
         lines.append("")
 
     lines.append("Reading: features-only near the majority baseline (and")
     lines.append("cards-only at the mixed-group baseline) means the mode is")
     lines.append("genuinely hidden; a large features-only accuracy, or")
     lines.append("cards-only above its baseline, means the bot reveals its")
-    lines.append("mode through its own bets and memory is redundant.")
+    lines.append("mode through its own bets and memory is redundant. The")
+    lines.append("within-group AUC is the sharp test: it ignores the")
+    lines.append("accuracy that the per-summary bias can manufacture, so a")
+    lines.append("value near 0.5 means the agent's hole cards carry no mode")
+    lines.append("information and a value near 1.0 means they carry it all.")
+    lines.append("When that AUC is above 0.5, read the card-ambiguous subset")
+    lines.append("flip rate instead: it restricts the counterfactual to states")
+    lines.append("whose cards give no strong ranking, so a flip there is the")
+    lines.append("only decision-time number the cards cannot explain.")
     return "\n".join(lines)
 
 
