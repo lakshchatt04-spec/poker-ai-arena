@@ -72,6 +72,11 @@ HISTORY_HIDDEN = 64
 HISTORY_GAIN = 1.0
 POLICY_GAIN = 0.01
 VALUE_GAIN = 1.0
+#: Gain for the optional auxiliary head.  It reads only the GRU state, so a
+#: normal (non-tiny) initialisation is appropriate: this head is a supervised
+#: probe, not a policy output whose initial noise would distort the action
+#: distribution.
+AUX_GAIN = 1.0
 
 
 def validate_history(tokens: Tensor, mask: Tensor) -> None:
@@ -194,6 +199,9 @@ class HistoryPolicyValueNet(nn.Module):
             is ``hidden + history_hidden``.
         history_hidden: Width of the GRU state.
         num_actions: Must equal RLCard's action count.
+        aux_coin: Add a supervised head that predicts the opponent's private
+            coin from the GRU state.  Off by default, so old checkpoints keep
+            the same parameter count and state-dict keys.
     """
 
     def __init__(
@@ -202,6 +210,8 @@ class HistoryPolicyValueNet(nn.Module):
         hidden: int = HIDDEN_WIDTH,
         history_hidden: int = HISTORY_HIDDEN,
         num_actions: int = NUM_ACTIONS,
+        *,
+        aux_coin: bool = False,
     ) -> None:
         super().__init__()
 
@@ -219,6 +229,7 @@ class HistoryPolicyValueNet(nn.Module):
         self.hidden = int(hidden)
         self.history_hidden = int(history_hidden)
         self.num_actions = int(num_actions)
+        self.aux_coin = bool(aux_coin)
 
         self.trunk = nn.Sequential(
             nn.Linear(self.feature_dim, self.hidden),
@@ -236,10 +247,21 @@ class HistoryPolicyValueNet(nn.Module):
         self.policy_head = nn.Linear(head_input, self.num_actions)
         self.value_head = nn.Linear(head_input, 1)
 
+        # The auxiliary head deliberately reads *only* the memory state.  If it
+        # read the observation trunk as well, the hole cards -- which the probe
+        # showed carry 0.62-0.88 within-summary AUC for the coin -- could satisfy
+        # the label without the GRU carrying anything.  Reading memory alone
+        # makes a high aux accuracy evidence that the recurrent channel holds
+        # the coin, not that the trunk can guess it from the cards.
+        if self.aux_coin:
+            self.aux_head = nn.Linear(self.history_hidden, 1)
+
         self._orthogonal_init(self.trunk[0], math.sqrt(2.0))
         self._orthogonal_init(self.trunk[2], math.sqrt(2.0))
         self._orthogonal_init(self.policy_head, POLICY_GAIN)
         self._orthogonal_init(self.value_head, VALUE_GAIN)
+        if self.aux_coin:
+            self._orthogonal_init(self.aux_head, AUX_GAIN)
 
     @staticmethod
     def _orthogonal_init(layer: nn.Linear, gain: float) -> None:
@@ -271,6 +293,57 @@ class HistoryPolicyValueNet(nn.Module):
         Returns:
             ``(logits, value)``.  Illegal logits are :data:`MASKED_LOGIT`.
         """
+
+        hidden, _ = self._representations(
+            features, tokens, history_mask, legal_mask, use_history=use_history
+        )
+        logits = self.policy_head(hidden).masked_fill(~legal_mask, MASKED_LOGIT)
+        value = self.value_head(hidden).squeeze(-1)
+        return logits, value
+
+    def forward_with_aux(
+        self,
+        features: Tensor,
+        tokens: Tensor,
+        history_mask: Tensor,
+        legal_mask: Tensor,
+        *,
+        use_history: bool = True,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Like :meth:`forward`, plus the auxiliary coin logit.
+
+        The third output is the auxiliary head's logit for "the opponent's coin
+        was heads", read from the GRU state only.  With ``use_history=False``
+        that state is zero, so the head can only return a constant: the control
+        arm cannot learn the label from the observation.
+
+        Raises:
+            ValueError: If the network was built without ``aux_coin=True``.
+        """
+
+        if not self.aux_coin:
+            raise ValueError(
+                "forward_with_aux needs a network built with aux_coin=True"
+            )
+
+        hidden, memory = self._representations(
+            features, tokens, history_mask, legal_mask, use_history=use_history
+        )
+        logits = self.policy_head(hidden).masked_fill(~legal_mask, MASKED_LOGIT)
+        value = self.value_head(hidden).squeeze(-1)
+        aux_logit = self.aux_head(memory).squeeze(-1)
+        return logits, value, aux_logit
+
+    def _representations(
+        self,
+        features: Tensor,
+        tokens: Tensor,
+        history_mask: Tensor,
+        legal_mask: Tensor,
+        *,
+        use_history: bool,
+    ) -> tuple[Tensor, Tensor]:
+        """Validate inputs and return ``(concat trunk+memory, memory)``."""
 
         if features.ndim != 2:
             raise ValueError(
@@ -304,10 +377,7 @@ class HistoryPolicyValueNet(nn.Module):
         if not use_history:
             memory = torch.zeros_like(memory)
 
-        hidden = torch.cat((observation, memory), dim=1)
-        logits = self.policy_head(hidden).masked_fill(~legal_mask, MASKED_LOGIT)
-        value = self.value_head(hidden).squeeze(-1)
-        return logits, value
+        return torch.cat((observation, memory), dim=1), memory
 
     def count_parameters(self) -> int:
         """Number of trainable parameters, for reports and A/B comparisons."""

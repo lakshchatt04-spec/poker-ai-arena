@@ -19,6 +19,10 @@ The objective, clipped:
     L_value  =  mean( ((V(s) - return) / std(return))^2 )
     L        =  L_policy - entropy_coef * H[pi] + value_coef * L_value
 
+When the optional auxiliary coin head is used (Agent B only), the update adds
+``aux_coef * BCE(aux_logit, coin)`` over the rows that carry a coin label.
+Self-play rows have no opponent coin and are excluded.
+
 Advantages are normalised **once** per rollout, before the epochs start.  Doing
 it per minibatch would change the objective between epochs and let the same
 sample mean something different on every pass.
@@ -103,6 +107,10 @@ class PPOConfig:
     learning_rate: float = 3e-4
     #: Normalise advantages once per rollout, before the epochs.
     normalize_advantages: bool = True
+    #: Weight on the auxiliary coin-prediction loss.  Zero is a no-op, and a
+    #: caller that does not supply ``aux_labels`` ignores it.  Agent B's aux
+    #: experiment sets this positive; Agent A never uses the term.
+    aux_coef: float = 0.0
 
     def __post_init__(self) -> None:
         if not 0.0 < float(self.clip_epsilon) < 1.0:
@@ -135,6 +143,10 @@ class PPOConfig:
         if float(self.learning_rate) <= 0.0:
             raise ValueError(
                 f"learning_rate must be positive, got {self.learning_rate!r}"
+            )
+        if float(self.aux_coef) < 0.0:
+            raise ValueError(
+                f"aux_coef must be non-negative, got {self.aux_coef!r}"
             )
 
 
@@ -234,13 +246,16 @@ def run_ppo_update(
     optimizer: torch.optim.Optimizer,
     generator: torch.Generator | None,
     count: int,
-    forward: Callable[[Tensor], tuple[Tensor, Tensor]],
+    forward: Callable[
+        [Tensor], tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]
+    ],
     actions: np.ndarray,
     log_probs: np.ndarray,
     values: np.ndarray,
     advantages: np.ndarray,
     returns: np.ndarray,
     entropy_weights: np.ndarray | None = None,
+    aux_labels: np.ndarray | None = None,
 ) -> dict[str, float | int]:
     """Run the clipped PPO update over one fixed batch of decisions.
 
@@ -270,10 +285,16 @@ def run_ppo_update(
             ``entropy_coef_preflop`` multiplies the weighted mean entropy over
             the marked rows (the caller marks pre-flop decisions), instead of
             spreading the bonus over every decision.
+        aux_labels: Optional ``(count,)`` integer coin labels in ``{0, 1}``.  A
+            ``-1`` marks a decision with no label -- self-play hands have no
+            opponent coin -- and those rows are excluded from the auxiliary
+            loss.  Supplying this requires ``forward`` to return a third tensor,
+            the auxiliary logits.
 
     Returns:
         Batch-mean diagnostics plus the critic's explained variance and the
-        rollout's return standard deviation.
+        rollout's return standard deviation.  When ``aux_labels`` is supplied,
+        ``aux_loss`` and ``aux_accuracy`` are included as well.
     """
 
     normalised_advantages = (
@@ -294,6 +315,23 @@ def run_ppo_update(
                 "entropy_weights must be finite and non-negative"
             )
         entropy_weights_tensor = torch.as_tensor(weights)
+
+    aux_labels_tensor: Tensor | None = None
+    labelled_rows = 0
+    if aux_labels is not None:
+        labels_array = np.asarray(aux_labels)
+        if labels_array.shape != (int(count),):
+            raise ValueError(
+                f"aux_labels must be ({int(count)},), got {labels_array.shape}"
+            )
+        if not np.issubdtype(labels_array.dtype, np.integer):
+            raise ValueError(
+                f"aux_labels must be integers, got {labels_array.dtype}"
+            )
+        if not np.isin(labels_array, (-1, 0, 1)).all():
+            raise ValueError("aux_labels must contain only -1, 0 or 1")
+        labelled_rows = int((labels_array >= 0).sum())
+        aux_labels_tensor = torch.as_tensor(labels_array.astype(np.int64))
 
     # Diagnostics about the critic that produced this rollout.  Measured
     # before any gradient step, so it describes the sampling policy's own
@@ -335,9 +373,13 @@ def run_ppo_update(
         "clip_fraction": 0.0,
         "grad_norm": 0.0,
     }
+    if aux_labels_tensor is not None:
+        totals["aux_loss"] = 0.0
+        totals["aux_accuracy"] = 0.0
     visited = 0
     minibatches = 0
     preflop_visited = 0
+    aux_visited = 0
 
     net.train()
 
@@ -348,7 +390,18 @@ def run_ppo_update(
             index = torch.as_tensor(rows, dtype=torch.long)
             weight = len(rows)
 
-            logits, batch_values = forward(index)
+            outputs = forward(index)
+            if len(outputs) == 3:
+                logits, batch_values, aux_logits = outputs
+            else:
+                logits, batch_values = outputs
+                aux_logits = None
+            if aux_labels_tensor is not None and aux_logits is None:
+                raise ValueError(
+                    "aux_labels were supplied but forward returned only "
+                    "(logits, values); pass the auxiliary head's logits as a "
+                    "third tensor"
+                )
             distribution = Categorical(logits=logits)
             new_log_probs = distribution.log_prob(actions_tensor[index])
             entropy, entropy_preflop = entropy_terms(
@@ -387,6 +440,25 @@ def run_ppo_update(
                 + float(config.value_coef) * value_loss
             )
 
+            aux_loss = None
+            aux_accuracy = 0.0
+            aux_rows = 0
+            if aux_labels_tensor is not None:
+                row_labels = aux_labels_tensor[index]
+                keep = row_labels >= 0
+                aux_rows = int(keep.sum())
+                if aux_rows:
+                    targets = row_labels[keep].to(torch.float32)
+                    scores = aux_logits[keep]  # type: ignore[index]
+                    aux_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                        scores, targets
+                    )
+                    with torch.no_grad():
+                        aux_accuracy = float(
+                            ((scores > 0.0) == targets.bool()).float().mean()
+                        )
+                    loss = loss + float(config.aux_coef) * aux_loss
+
             optimizer.zero_grad()
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -413,14 +485,25 @@ def run_ppo_update(
             totals["approx_kl"] += float(approx_kl) * weight
             totals["clip_fraction"] += float(clip_fraction) * weight
             totals["grad_norm"] += float(grad_norm) * weight
+            if aux_loss is not None:
+                totals["aux_loss"] += float(aux_loss.detach()) * aux_rows
+                totals["aux_accuracy"] += aux_accuracy * aux_rows
+                aux_visited += aux_rows
             visited += weight
             minibatches += 1
 
     stats: dict[str, float | int] = {
         name: total / visited
         for name, total in totals.items()
-        if name != "entropy_preflop"
+        if name not in ("entropy_preflop", "aux_loss", "aux_accuracy")
     }
+    if aux_labels_tensor is not None:
+        stats["aux_loss"] = (
+            totals["aux_loss"] / aux_visited if aux_visited else 0.0
+        )
+        stats["aux_accuracy"] = (
+            totals["aux_accuracy"] / aux_visited if aux_visited else 0.0
+        )
     if entropy_weights_tensor is not None:
         stats["entropy_preflop"] = (
             totals["entropy_preflop"] / preflop_visited

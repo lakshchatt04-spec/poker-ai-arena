@@ -132,6 +132,29 @@ def _checkpoint_paths(
     raise ValueError(f"unknown mode {mode!r}")
 
 
+def _policy_for(net, metadata: dict, kind: str, encoder: ObservationEncoder):
+    """Build the policy that matches how a checkpoint was trained.
+
+    A control-arm checkpoint was trained with the GRU output zeroed, so its
+    memory weights are meaningless.  Evaluating it with the channel on would
+    feed a random vector into a head that never learned to read one.
+
+    This is applied to the auxiliary-head checkpoints, which are the first ones
+    whose updater also zeroed the channel while scoring.  The older control
+    checkpoints were scored with the channel active (a bug fixed at the same
+    time), so they are still evaluated the way the published tables did it:
+    ``metadata['aux_coin']`` is the marker that distinguishes the two families.
+    """
+
+    if kind != "agent_b":
+        return make_policy(net, kind, encoder)
+    config = dict(metadata.get("config", {}))
+    use_history = True
+    if metadata.get("aux_coin") and config.get("use_history") is False:
+        use_history = False
+    return AgentBPolicy(net, encoder, use_history=use_history)
+
+
 def _policies(
     mode: str, first: Path, second: Path, encoder: ObservationEncoder
 ):
@@ -141,14 +164,14 @@ def _policies(
         return None
 
     net_first, meta_first, kind_first = load_agent(first)
-    policy_first = make_policy(net_first, kind_first, encoder)
+    policy_first = _policy_for(net_first, meta_first, kind_first, encoder)
 
     if mode == "ablation":
         policy_second = AgentBPolicy(net_first, encoder, use_history=False)
         return policy_first, policy_second, meta_first
 
     net_second, meta_second, kind_second = load_agent(second)
-    policy_second = make_policy(net_second, kind_second, encoder)
+    policy_second = _policy_for(net_second, meta_second, kind_second, encoder)
     return policy_first, policy_second, meta_first
 
 

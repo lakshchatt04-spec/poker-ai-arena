@@ -43,9 +43,15 @@ class HistoryPPOUpdater:
         config: PPOConfig | None = None,
         *,
         seed: int | None = None,
+        use_history: bool = True,
     ) -> None:
         self.net = net
         self.config = PPOConfig() if config is None else config
+        # The control arm samples with the GRU zeroed, so its PPO rescoring must
+        # zero it too.  Otherwise ``log_pi_old`` describes a different policy
+        # than the one that chose the action, and the ratio is not 1 on the first
+        # epoch.  This flag keeps sampling and scoring on the same network.
+        self.use_history = bool(use_history)
         self.optimizer = torch.optim.Adam(
             net.parameters(), lr=float(self.config.learning_rate)
         )
@@ -78,12 +84,23 @@ class HistoryPPOUpdater:
 
         entropy_weights = preflop_rows(batch.features).astype(np.float64)
 
-        def forward(index: Tensor) -> tuple[Tensor, Tensor]:
+        def forward(
+            index: Tensor,
+        ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
+            if self.net.aux_coin:
+                return self.net.forward_with_aux(
+                    features[index],
+                    tokens[index],
+                    history_masks[index],
+                    legal_masks[index],
+                    use_history=self.use_history,
+                )
             return self.net(
                 features[index],
                 tokens[index],
                 history_masks[index],
                 legal_masks[index],
+                use_history=self.use_history,
             )
 
         return run_ppo_update(
@@ -99,6 +116,7 @@ class HistoryPPOUpdater:
             advantages=batch.advantages,
             returns=batch.returns,
             entropy_weights=entropy_weights,
+            aux_labels=batch.coin_labels if self.net.aux_coin else None,
         )
 
 
@@ -152,6 +170,18 @@ def _validate_history_batch(batch: HistoryRolloutBatch) -> None:
         raise ValueError(
             f"legal_masks must be bool, got {batch.legal_masks.dtype}"
         )
+    if batch.coin_labels is not None:
+        labels = np.asarray(batch.coin_labels)
+        if labels.shape != (count,):
+            raise ValueError(
+                f"coin_labels must be ({count},), got {labels.shape}"
+            )
+        if not np.issubdtype(labels.dtype, np.integer):
+            raise ValueError(
+                f"coin_labels must be integers, got {labels.dtype}"
+            )
+        if not np.isin(labels, (-1, 0, 1)).all():
+            raise ValueError("coin_labels must contain only -1, 0 or 1")
 
     for name in ("log_probs", "values", "advantages", "returns"):
         values = getattr(batch, name)

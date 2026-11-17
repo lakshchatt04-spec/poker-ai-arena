@@ -16,6 +16,14 @@ every forward pass.  It therefore receives no gradient.  Comparing the two arms 
 identical deals answers "does the memory channel help?", while comparing Agent B
 against Agent A answers "is the whole B agent better?".
 
+``--aux-coin`` adds a supervised head that predicts the opponent's private coin
+from the GRU state, trained jointly with PPO at weight ``--aux-coef``.  The head
+never reads the observation trunk, so a high accuracy cannot come from the hole
+cards.  Its control is ``--aux-coin --no-history``: the same head then sees only
+zeros and cannot learn the label, which isolates the effect of *supervising* the
+memory channel from the effect of merely having the head.  Use
+``scripts/aux_coin_probe.py`` to score a checkpoint on held-out deals.
+
 ``value`` is the mean squared value error divided by the rollout's return
 variance, so ``0`` is a perfect critic and ``1`` predicts the mean.  ``EV`` is the
 explained variance of the critic that collected the rollout.
@@ -148,6 +156,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-history", action="store_true",
         help="control arm: zero the GRU output in every forward pass",
     )
+    parser.add_argument(
+        "--aux-coin", action="store_true",
+        help="add the auxiliary head that predicts the opponent's coin from the "
+             "GRU state, trained jointly with PPO",
+    )
+    parser.add_argument(
+        "--aux-coef", type=float, default=1.0,
+        help="weight on the auxiliary coin-prediction loss (default: 1.0; only "
+             "used with --aux-coin)",
+    )
     return parser.parse_args(argv)
 
 
@@ -168,16 +186,26 @@ def _config_from(args: argparse.Namespace) -> TrainingConfigB:
         ppo=PPOConfig(
             learning_rate=args.learning_rate,
             entropy_coef_preflop=args.preflop_entropy_coef,
+            aux_coef=args.aux_coef if args.aux_coin else 0.0,
         ),
         history_hidden=args.history_hidden,
         use_history=not args.no_history,
+        aux_coin=args.aux_coin,
     )
 
 
-def _format_row(row: dict[str, float | int], *, preflop: bool) -> str:
+def _format_row(
+    row: dict[str, float | int], *, preflop: bool, aux: bool = False
+) -> str:
     preflop_column = ""
     if preflop:
         preflop_column = f"{float(row['entropy_preflop']):>9.4f}"
+    aux_column = ""
+    if aux:
+        aux_column = (
+            f"{float(row.get('aux_loss', 0.0)):>9.4f}"
+            f"{float(row.get('aux_accuracy', 0.0)):>8.3f}"
+        )
     return (
         f"{int(row['iteration']):>5}"
         f"{int(row['decisions']):>11}"
@@ -189,6 +217,7 @@ def _format_row(row: dict[str, float | int], *, preflop: bool) -> str:
         f"{float(row['approx_kl']):>8.4f}"
         f"{float(row['clip_fraction']):>7.2f}"
         f"{float(row['grad_norm']):>7.3f}"
+        f"{aux_column}"
     )
 
 
@@ -197,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     config = _config_from(args)
 
     print("Poker AI Arena - Agent B training")
-    print(f"agent B parameters : {HistoryPolicyValueNet(history_hidden=config.history_hidden).count_parameters():,}"
+    print(f"agent B parameters : {HistoryPolicyValueNet(history_hidden=config.history_hidden, aux_coin=config.aux_coin).count_parameters():,}"
           f"   agent A: {PolicyValueNet().count_parameters():,}")
     print(
         f"iterations {config.iterations}  hands/iter {config.hands_per_iteration}"
@@ -223,6 +252,11 @@ def main(argv: list[str] | None = None) -> int:
         f"history  {'on' if config.use_history else 'off (control arm)'}"
         f"  width {config.history_hidden}"
     )
+    if config.aux_coin:
+        print(
+            f"aux head : coin prediction from the GRU state only"
+            f"  coef {config.ppo.aux_coef}"
+        )
     print(
         f"seed {config.seed}  eval seed {config.evaluation_seed}"
         f"  run name {config.run_name!r}"
@@ -237,13 +271,18 @@ def main(argv: list[str] | None = None) -> int:
 
     show_preflop = float(config.ppo.entropy_coef_preflop) > 0.0
     preflop_header = f"{'pre-ent':>9}" if show_preflop else ""
+    aux_header = f"{'aux-loss':>9}{'aux-acc':>8}" if config.aux_coin else ""
     print(
         f"{'iter':>5}{'decisions':>11}{'policy':>9}{'value':>8}{'EV':>8}"
         f"{'entropy':>9}{preflop_header}{'KL':>8}{'clip':>7}{'grad':>7}"
+        f"{aux_header}"
     )
 
     def progress(row, records) -> None:
-        print(_format_row(row, preflop=show_preflop), flush=True)
+        print(
+            _format_row(row, preflop=show_preflop, aux=config.aux_coin),
+            flush=True,
+        )
         for record in records or ():
             result = record.result
             print(

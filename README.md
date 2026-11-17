@@ -12,11 +12,11 @@ at poker?**
 | | |
 |---|---|
 | **What it is** | RLCard environment → 131-feature observation encoder → PPO trainer → paired, fixed-deal evaluation harness, with two agents and a capacity-matched control |
-| **Agents** | **A:** 100,869-parameter MLP over the current state. **B:** 116,933-parameter MLP + GRU over the betting history |
-| **Headline result** | Against a bot whose play depends on history the observation cannot recover, memory is worth **`+0.236` bb/hand** over the capacity-matched control — but a within-checkpoint ablation and a clairvoyance ceiling show the converged policy captures only **~2 %** of the information's value |
+| **Agents** | **A:** 100,869-parameter MLP over the current state. **B:** 116,933-parameter MLP + GRU over the betting history (116,998 with the optional auxiliary head) |
+| **Headline result** | Against a bot whose play depends on history the observation cannot recover, memory is worth **`+0.236` bb/hand** over the capacity-matched control — but a within-checkpoint ablation and a clairvoyance ceiling show the converged policy captures only **~2 %** of the information's value. A supervised coin head recovers the coin from the memory at AUC `0.99` yet leaves the paired payoff unchanged |
 | **Stack** | Python 3.14, PyTorch, NumPy, RLCard, matplotlib; pytest for the suite |
-| **Scale** | ~12,500 lines across 46 Python modules · 39 training runs · three seeds per arm · 2,000 paired deals per comparison cell |
-| **Tests** | `294 passed` — simulator contract, encoder bounds, action masking, GAE identities, PPO invariants, checkpoint round-trips, bit-reproducibility |
+| **Scale** | ~13,300 lines across 47 Python modules · 45 training runs · three seeds per arm · 2,000 paired deals per comparison cell |
+| **Tests** | `301 passed` — simulator contract, encoder bounds, action masking, GAE identities, PPO invariants, checkpoint round-trips, bit-reproducibility |
 
 ## What this demonstrates
 
@@ -146,6 +146,8 @@ poker-ai-arena/
 │   ├── compare_matrix.py           # the whole seed x opponent matrix, one table
 │   ├── history_reliance.py         # how often removing memory changes the action
 │   ├── history_probe.py            # is the opponent's hidden mode in the observation?
+│   ├── clairvoyance_ceiling.py     # what perfect knowledge of the coin would be worth
+│   ├── aux_coin_probe.py           # does the supervised head recover the coin?
 │   ├── proxy_break.py              # does memory matter once the card proxy is broken?
 │   ├── train_agent_a.py            # trains Agent A and evaluates it
 │   └── train_agent_b.py            # trains Agent B (or its control arm)
@@ -2329,6 +2331,107 @@ ignored at the one decision where it is hidden -- was too strong: the card-free
 summary hides it, but the agent's own cards carry information about it, and the
 subset test is the claim that survives.
 
+### A supervised coin head: the representation learns, the policy does not
+
+The 100-iteration result leaves an optimisation question. The coin is in the
+action tokens, the ceiling says it is worth `+0.65` bb/hand, and the converged
+policy still leaves it unused. One explanation is representational: the GRU
+never forms a coin variable, so the policy has nothing to read. `--aux-coin`
+tests that directly. It adds a 65-parameter linear head on the GRU state and
+trains it with `BCE(head, coin)` at weight `1.0` alongside PPO. The label is
+`CoinOpenerBettor.coin`; self-play rows carry no opponent coin and are masked
+out (`-1`). The head reads **only** the GRU state, never the observation trunk,
+so a high accuracy cannot be satisfied by the hole cards that the card-leak
+probe showed are informative. With the head off (the default) the network is
+unchanged at 116,933 parameters; with it on it is 116,998.
+
+Six 100-iteration runs use the same seeds, deals, opponents and pre-flop
+entropy as the deterministic private-coin runs: `auxcoin` seeds 0/1/2 and
+`auxcontrol` seeds 0/1/2, where the control passes `--no-history` and the head
+therefore sees only zeros. The control cannot learn the label: its input is
+constant, so its best output is the labelled-row majority.
+
+The held-out probe plays 2,000 fresh deals per seed against `coin_opener`:
+
+| seed | history on | AUC | history off | AUC | first decision (empty history) | later decisions |
+|---|---|---|---|---|---|---|
+| 0 | 94.3 % | 0.994 | 57.8 % | 0.500 | 48.6 % | 100.0 % |
+| 1 | 94.1 % | 0.993 | 45.3 % | 0.500 | 51.4 % | 100.0 % |
+| 2 | 94.3 % | 0.994 | 58.7 % | 0.500 | 48.6 % | 100.0 % |
+
+The split is the decisive column. The first decision of a hand has no tokens,
+and the head is at chance there. Every later decision is classified perfectly.
+That is exactly the predictability the identifiability probe already found: the
+coin is recoverable from the pre-flop action tokens with 100 % accuracy, because
+one coin raises and the other calls. The head has not discovered a new private
+signal; it has copied the public action record into the GRU. The in-run
+diagnostics tell the same story. At iteration 100 the history arms finish at an
+auxiliary loss of `0.08-0.09` and accuracy `93-94 %`, while the controls sit at
+the constant `0.67-0.69` / `55-61 %`.
+
+So the manipulation works: the GRU now carries the coin. The question is
+whether the policy turns it into money. It does not. On the paired matrix at 100
+(2,000 shared deals per cell), aux history minus aux control:
+
+| opponent | per seed | mean | seeds same sign | resolved |
+|---|---|---|---|---|
+| `coin_opener` | -0.0705 / -0.0210 / +0.0732 | **-0.0061** | 2/3 | 0/3 |
+| `passive` | -0.0135 / -0.0525 / +0.0077 | -0.0194 | 2/3 | 0/3 |
+| `raiser_strong` | +0.1025 / -0.0395 / +0.0152 | +0.0261 | 2/3 | 0/3 |
+| `raiser_loose` | -0.1040 / -0.0095 / +0.0262 | -0.0291 | 2/3 | 0/3 |
+
+No seed-level cell resolves, and the training-opponent mean is indistinguishable
+from zero. Supervision did not create the memory advantage that the older
+control suggested. The direct test of the aux loss, aux history minus the old
+history arm (same seeds, same deals), is also null: the means are `+0.0095`,
+`-0.0457`, `+0.0685` and `-0.0340` on the four opponents, with three resolved
+seed cells in mixed directions. The within-checkpoint ablation agrees. Zeroing
+the channel in the aux checkpoints changes the payoff by `-0.0052` on the
+training opponent and by `-0.0063`, `-0.0215` and `-0.0547` on the held-out bots;
+one seed resolves in each of three opponents and the signs are mixed, including
+`+0.0995` on `coin_opener` seed 1 (zeroing the channel *helps*) and `-0.1360` on
+`raiser_loose` seed 0 (it hurts). The old history arm's `+0.0403` ablation does
+not reproduce. A representation of the coin is not the same thing as a policy
+that uses it.
+
+There is a measurement correction in this arm. The aux control is the first
+control trained with `HistoryPPOUpdater(use_history=False)`, so its PPO
+rescoring zeroes the GRU exactly as its sampling did. The older control arm
+sampled with the channel off but rescored with it on, so its first-epoch ratio
+was not 1 and its policy was fitted against the wrong old log-probabilities. The
+history arm is unaffected: its in-run evaluation against `coin_opener` is
+`+0.4607` in the old runs and `+0.4605` in the aux runs. The corrected control is
+stronger (`+0.3463` vs `+0.2351` in-run), and the paired gap at 100 falls from
+`+0.1463` to `-0.0061`. The old checkpoints and published tables are left as
+they were, and `compare_matrix.py` evaluates them the old way so the tables stay
+reproducible; but the `+0.146` should now be read as a control-arm artefact, not
+as a memory advantage. This correction does not revive the coin: the
+decision-time ablation is still zero.
+
+The reliance probe shows what the supervision did change. On the final aux
+checkpoints (1,000 deals per seed, base seed 20,000):
+
+| seed | mixed first flops | complementary pre-flop | flips in mixed | card-ambiguous subset | flips on subset |
+|---|---|---|---|---|---|
+| 0 | 594/798 (74.4 %) | 88.9 % | 97/594 (16.3 %) | 215 | 32 (14.9 %) |
+| 1 | 206/803 (25.7 %) | 20.4 % | 0/206 (0.0 %) | 71 | 0 (0.0 %) |
+| 2 | 426/782 (54.5 %) | 64.0 % | 27/426 (6.3 %) | 167 | 11 (6.6 %) |
+| pooled | 1,226 | | 124 (10.1 %) | 453 | 43 (9.5 %) |
+
+The old history checkpoints flipped `5/1,134` (0.4 %) of mixed decisions and
+`2/420` (0.5 %) of the card-ambiguous subset. The aux channel is therefore more
+behaviourally salient on two of three seeds, but not on seed 1, and the ablation
+says the extra flips are not worth anything. A flip measures only that zeroing
+the channel changes the action, not that the change is correct. The supervised
+head supplies a representation; it does not supply the policy gradient that
+would make the coin-conditional action pay.
+
+The conclusion is narrow and useful. The coin is not missing from the memory: a
+linear probe on the GRU recovers it almost perfectly. It is missing from the
+policy's objective. The `+0.65` bb/hand ceiling is still unclaimed, and the
+bottleneck is credit assignment at the first flop decision, not the recurrent
+representation.
+
 ### Verdict for Stage 3c
 
 The private coin was the cleanest version of the experiment available: the
@@ -2340,21 +2443,27 @@ card-blind subset. Even there the result is the Stage 3 pattern:
 
 * training with the channel is worth `+0.204` bb/hand at 50 in the first
   replicate and `+0.146` at 100 in the deterministic run (3/3 seeds positive at
-  100, one seed resolved);
+  100, one seed resolved); the older 100-iteration control rescored with the
+  channel on, however, and the aux experiment's corrected control removes that
+  gap (`-0.0061`), so the `+0.146` is not a clean memory effect;
 * the converged policy uses the channel on about `0.4 %` of the decisions where
   it is informative at 100 (`1.0 %` at 50), including `0.5 %` on the
   card-ambiguous subset where the hole cards give no strong ranking;
 * the ablation is `+0.015` bb/hand at 50 and `+0.040` at 100 (3/3 seeds
   positive, one resolved);
+* a supervised coin head lifts the GRU's held-out coin accuracy to `94 %`
+  (AUC `0.99`), but the paired aux-history-minus-control gap is `-0.0061` on
+  `coin_opener`, all twelve seed cells are unresolved, and the ablation is
+  `-0.0052`; the representation is not the bottleneck;
 * but perfect knowledge of the coin at that decision is worth `+1.37` bb per
   ambiguous decision (`+0.65` bb/hand over all deals), so the policy captures
   about `2 %` of the value the information could buy.
 
-Since the channel's decision-time value comes from the public action sequence
-rather than from the coin -- and the card-ambiguous subset reproduces the same
-~0.5 % flip rate, so the small number of flips cannot be credited to the cards
-either -- the training benefit cannot be an information advantage about the
-hidden state. The most economical reading is that the
+Since the channel's decision-time value in the old history checkpoints comes
+from the public action sequence rather than from the coin -- and the
+card-ambiguous subset reproduces the same ~0.5 % flip rate there, so the small
+number of flips cannot be credited to the cards either -- the older training
+benefit cannot be an information advantage about the hidden state. The most economical reading is that the
 recurrent pathway changes the optimisation -- it adds 16 dimensions to the head
 input and a gradient path through the token sequence -- and the converged greedy
 policy then spends almost none of it on the coin. A capacity or optimisation
@@ -2362,22 +2471,26 @@ effect, not memory. The ceiling rules out the other explanation, that the coin
 was worth too little for the ablation to differ from zero: there was `+0.65`
 bb/hand on the table, and the converged policy left nearly all of it.
 
-The 50-iteration caveat is now settled by the 100-iteration runs, and it points
-the other way. The training gap does not shrink: within the deterministic run it
-grows from `-0.006` to `+0.146` on the training opponent, with 3/3 seeds
-positive, and the held-out gaps are positive on 2-3 of three seeds each. So the
-`+0.204` measured at 50 in the first replicate was not evidence of a head start
-that longer training absorbs; if anything, the channel's training advantage
-compounds. That strengthens the optimisation reading: the recurrent pathway
-changes the trajectory, and the converged greedy policy still leaves nearly all
-of the `+0.65` bb/hand ceiling unclaimed.
+The 50-iteration caveat is now settled by the 100-iteration runs, but not in
+the direction the first comparison suggested. Within the deterministic run the
+training gap moves from `-0.006` to `+0.146` on the training opponent, with 3/3
+seeds positive. The aux experiment, however, adds a control arm whose PPO
+rescoring also zeroes the channel. The history arm is unchanged (`+0.4607` vs
+`+0.4605` in-run against `coin_opener`), while the corrected control is stronger
+(`+0.2351` -> `+0.3463`), and the paired gap falls to `-0.0061`. The `+0.146`
+therefore looks like a control-arm artefact, not a training advantage that
+compounds. The decision-time conclusion does not depend on it: the recurrent
+pathway changes the trajectory, and the converged greedy policy still leaves
+nearly all of the `+0.65` bb/hand ceiling unclaimed. The 50-iteration
+replicates' sign disagreement (`+0.204` vs `-0.006`) is a separate warning that
+the training-time gap is not stable.
 
 Two limits remain. The two 50-iteration replicates disagree in sign
-(`+0.204` vs `-0.006`), so the 50 baseline is not stable and the growth from 50
-to 100 should be read as a direction, not a measured slope. And the 100-iteration
-training gap, while 3/3 in sign, resolves on one seed only. Neither limit touches
-the decision-time claim, which is measured on identical deals and is 3/3 in sign
-with one resolved seed at 100.
+(`+0.204` vs `-0.006`), so the 50 baseline is not stable. And the 100-iteration
+training gap, even before the control correction, resolves on one seed only;
+after the correction it is zero. Neither limit touches the decision-time claim,
+which is measured on identical deals and is 3/3 in sign with one resolved seed at
+100.
 
 ### Agent A against these checkpoints
 
@@ -2460,10 +2573,10 @@ memory.
 * The encoder, the policy/value network, the rollout buffer, the PPO update and
   the training loop all exist. Agent B's network, rollout, PPO updater, training
   loop, checkpointing, paired comparison and history-reliance diagnostic are
-  implemented, tested and exercised on thirty-nine runs (the six original
+  implemented, tested and exercised on forty-five runs (the six original
   runs, the nine Stage 3 runs, the six pre-flop-entropy runs, the six
-  100-iteration mixed-opening runs, the six private-coin runs and their six
-  single-threaded 100-iteration repeats).
+  100-iteration mixed-opening runs, the six private-coin runs, their six
+  single-threaded 100-iteration repeats and the six auxiliary-head runs).
 * Agent B's comparison is confounded slightly by capacity: B has `+15.9 %` more
   parameters than A. The control arm (same capacity, no history input) removes
   that confound for the "memory vs no memory" question, but the headline A-vs-B
@@ -2526,6 +2639,26 @@ memory.
   value (`+2.97`) includes runout luck and is not achievable at decision time.
   The ceiling measures the value of the information, not whether *any* training
   method could extract it.
+* **The older control arms were scored with the channel active.**
+  `HistoryPPOUpdater` did not receive `use_history`, so a control that sampled
+  with the GRU zeroed still rescored with it on. The aux runs fix this, and the
+  corrected control closes the private-coin paired gap from `+0.1463` to
+  `-0.0061` without changing the history arm. The old checkpoints and tables are
+  preserved (`compare_matrix.py` evaluates them as published), but the old
+  training-gap numbers should not be compared directly with the corrected ones.
+* **The auxiliary head recovers a public sequence, not a private signal.** Its
+  `100 %` accuracy on later decisions is the same `100 %` the token-only probe
+  already reported; the head is at chance on the first decision, when no tokens
+  exist. It proves the GRU can carry the coin, not that the coin is private at
+  the flop decision. One coefficient (`1.0`) and one label (the scripted coin)
+  were tried, so the null payoff result is specific to that supervision
+  strength.
+* **A channel flip is not a value measurement.** The aux checkpoints flip
+  `9.5 %` of the card-ambiguous subset (per seed `14.9 / 0.0 / 6.6 %`) against
+  `0.5 %` for the old history arm, but the within-checkpoint ablation is
+  `-0.0052` on the training opponent and mixed or negative elsewhere. The flip
+  count measures behavioural sensitivity; the ablation measures payoff. The
+  `9.5 %` pooled rate is dominated by seed 0, and seed 1 shows no flips at all.
 * One unexplained cell: the history arm loses about `0.20` bb/hand to the
   control against a uniform-random opponent (2 of 3 seeds resolved). Random play
   is an out-of-distribution probe, not part of the protocol, and twelve
@@ -2557,7 +2690,8 @@ memory.
 | 8 | Train history/control against the private coin | ✅ done — `+0.204` bb/hand at training time (2/3 seeds resolved), `+0.015` ablation (0/3), 1.2 % reliance at the hidden decision vs 0.5 % control |
 | 9 | Clairvoyance ceiling on the private coin | ✅ done — perfect knowledge of the coin is worth `+1.37` bb per ambiguous decision (`+0.65` bb/hand over all deals); the policy captures about 2 % |
 | 10 | Extend the mixed-opening runs to 100 iterations and test whether reliance decays | ✅ done — reliance is flat from iteration 10 to 100 (`~0.6` flop, `~1.0` all-decision logit shift vs `0.2-0.3` control); the ablation holds at `+0.045`, while the training-time gap shrinks from `+0.236` to `+0.055` as the control catches up |
-| 11 | Extend the private-coin runs to 100 iterations, single-threaded, and measure the full reliance curve | ✅ done — the training gap grows from `-0.006` to `+0.146` (3/3 seeds positive, 1 resolved) and the ablation from `+0.028` to `+0.040` (3/3); reliance is flat and the coin is still ignored at the private decision (`0.4 %` flips) |
+| 11 | Extend the private-coin runs to 100 iterations, single-threaded, and measure the full reliance curve | ✅ done — the old training gap moves from `-0.006` to `+0.146` (3/3 seeds positive, 1 resolved) and the ablation from `+0.028` to `+0.040` (3/3); reliance is flat and the coin is still ignored at the private decision (`0.4 %` flips). Row 12's corrected control closes the paired gap to `-0.006` |
+| 12 | Add a supervised auxiliary coin head on the GRU and test whether it makes the policy use the coin | ✅ done — held-out accuracy `94 %` (AUC `0.994`), but only after any history exists (first decision `48.6 %`, later `100 %`); the paired aux-history-minus-control gap is `-0.006` and all twelve seed cells are unresolved, the ablation is `-0.005`, and aux history vs old history is null. The representation is not the bottleneck |
 
 **Verdict: memory is a permanent decision-time input when the opening is
 genuinely mixed, and none of the mixed-opening advantage is a lasting
@@ -2580,12 +2714,15 @@ The private-coin experiment removes the agent's own opening from the
 confound and adds the ceiling. At 50 iterations training with the channel is
 worth `+0.204` bb/hand and the ablation `+0.015`; at 100 the deterministic
 replicate gives `+0.146` and `+0.040`, with the gap growing rather than
-shrinking. The ablation's value comes from the public sequence: zeroing the
-channel changes only `0.4 %` of the decisions where the coin is private. Perfect
-knowledge of the coin at the first flop decision is worth `+0.651` bb/hand. The
-information was there and valuable; the converged policy used about 2 % of it.
-That is the cleanest evidence that the recurrent channel acts on PPO's
-optimisation, not on the deployed policy's information.
+shrinking. That comparison used the older control, which rescored with the
+channel on; the aux experiment's corrected control closes the paired gap to
+`-0.0061` without changing the history arm, so the `+0.146` is best read as a
+control-arm artefact. The ablation's value comes from the public sequence:
+zeroing the channel changes only `0.4 %` of the decisions where the coin is
+private. Perfect knowledge of the coin at the first flop decision is worth
+`+0.651` bb/hand. The information was there and valuable; the converged policy
+used about 2 % of it. That is the cleanest evidence that the recurrent channel
+acts on PPO's optimisation, not on the deployed policy's information.
 
 **Measured: the coin is worth `+0.65` bb/hand and the policy captures 2 %.**
 Stage 3c's `+0.015` ablation was consistent with two stories -- the information
@@ -2593,12 +2730,12 @@ was worthless, or the policy could not use it. The ceiling separates them, and i
 came in far above the `0.01-0.03` bb/hand that would have settled the project in
 memory's favour. The next cheap question is therefore about optimisation, not
 opponents. The 100-iteration tests have now ruled out the decay explanation for
-both stages: reliance is flat, and the private-coin training gap grows rather
-than shrinks. The remaining question is why the channel is worth only `+0.040`
-when a perfect signal is worth `+0.65`. The natural follow-up is an auxiliary
-head that predicts the hidden mode, or more capacity, both of which change the
-research question from "does memory help?" to "what supervision makes memory
-help?".
+both stages: reliance is flat. The remaining question is why the channel is worth
+only `+0.040` when a perfect signal is worth `+0.65`. The auxiliary head answers
+the representation half: it recovers the coin from the GRU at AUC `0.99`, but the
+paired payoff and the ablation do not move. The remaining follow-ups are more
+capacity or a different credit-assignment scheme, not another representation
+probe.
 
 A sensible remaining Stage 2 scope:
 
@@ -2686,10 +2823,22 @@ A sensible remaining Stage 2 scope:
 23. ~~Extend the private-coin runs to 100 iterations, single-threaded, and
     measure the reliance curve at every checkpoint.~~ ✅ Six runs. The 50-to-100
     comparison uses their own iteration-50 checkpoints because the earlier
-    default-thread runs are an independent replicate. The training gap grows
+    default-thread runs are an independent replicate. The old training gap moves
     from `-0.006` to `+0.146` (3/3 seeds positive, 1 resolved) and the ablation
-    from `+0.028` to `+0.040` (3/3); reliance is flat from 20 to 100, and the
-    probe still flips only `0.4 %` of private-coin decisions (`0.5 %` on the
-    card-ambiguous subset, where the hole cards give no strong ranking; the
-    cards themselves leak the coin at within-summary AUC `0.68-0.88`). Next: an
-    auxiliary mode-prediction head or more capacity.
+    from `+0.028` to `+0.040` (3/3); the corrected control in item 24 closes the
+    paired gap to `-0.006`. Reliance is flat from 20 to 100, and the probe still
+    flips only `0.4 %` of private-coin decisions (`0.5 %` on the card-ambiguous
+    subset, where the hole cards give no strong ranking; the cards themselves
+    leak the coin at within-summary AUC `0.68-0.88`). Next: capacity or a
+    different credit-assignment scheme (item 24 tests the supervision route).
+24. ~~Add a supervised auxiliary coin head on the GRU output, trained jointly
+    with PPO, and test whether recovering the coin changes the policy.~~ ✅ Six
+    100-iteration runs (aux history/control, seeds 0/1/2). The head reaches
+    `94.3 %` held-out accuracy (AUC `0.994`), but it is at chance on the first
+    decision (`48.6 %`) and perfect on every later decision (`100 %`), so it is
+    reading the public action record. The paired gap against the corrected
+    control is `-0.0061` on `coin_opener` (all twelve cells unresolved), the
+    ablation is `-0.0052`, and aux history vs old history is within noise. The
+    corrected control also closes the old `+0.146` gap, identifying it as a
+    control-arm artefact. Next: capacity or a different credit-assignment
+    scheme, not another representation probe.

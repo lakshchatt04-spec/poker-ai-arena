@@ -64,6 +64,10 @@ from .training import (
 #: play loop; ``small_blind`` is the player id that posted it this hand.
 Policy = Callable[[Any, int, HistoryTracker, int], int]
 
+#: Agent B's log keeps Agent A's columns and adds the auxiliary head's
+#: diagnostics.  They are blank for runs without ``aux_coin``.
+TRAIN_FIELDS_B = TRAIN_FIELDS + ("aux_loss", "aux_accuracy")
+
 
 @dataclass(frozen=True)
 class AgentAPolicy:
@@ -159,6 +163,10 @@ class TrainingConfigB(TrainingConfig):
     #: When ``False``, training runs with the history side channel zeroed.  This
     #: is the control arm: same network, same heads, no memory input.
     use_history: bool = True
+    #: Add the supervised auxiliary head that predicts the opponent's coin from
+    #: the GRU state.  ``ppo.aux_coef`` sets its weight.  Off by default so the
+    #: existing history/control runs keep their exact architecture.
+    aux_coin: bool = False
 
     def __post_init__(self) -> None:
         TrainingConfig.__post_init__(self)
@@ -348,6 +356,7 @@ def save_checkpoint_b(
             "feature_dim": int(net.feature_dim),
             "hidden": int(net.hidden),
             "history_hidden": int(net.history_hidden),
+            "aux_coin": bool(net.aux_coin),
             "config": asdict(config),
         },
         destination,
@@ -365,11 +374,14 @@ def load_checkpoint_b(
         feature_dim=int(payload["feature_dim"]),
         hidden=int(payload["hidden"]),
         history_hidden=int(payload["history_hidden"]),
+        # Older checkpoints predate the auxiliary head and have no key.
+        aux_coin=bool(payload.get("aux_coin", False)),
     )
     net.load_state_dict(payload["state_dict"])
     return net, {
         "iteration": int(payload["iteration"]),
         "config": dict(payload["config"]),
+        "aux_coin": bool(payload.get("aux_coin", False)),
     }
 
 
@@ -391,14 +403,22 @@ def train_b(
 
     torch.manual_seed(int(config.seed))
     net = (
-        HistoryPolicyValueNet(history_hidden=int(config.history_hidden))
+        HistoryPolicyValueNet(
+            history_hidden=int(config.history_hidden),
+            aux_coin=bool(config.aux_coin),
+        )
         if net is None
         else net
     )
 
     env = make_environment(seed=int(config.seed))
     encoder = ObservationEncoder.from_environment(env)
-    updater = HistoryPPOUpdater(net, config.ppo, seed=int(config.seed))
+    updater = HistoryPPOUpdater(
+        net,
+        config.ppo,
+        seed=int(config.seed),
+        use_history=bool(config.use_history),
+    )
     rng = np.random.default_rng(int(config.seed))
     buffer = HistoryRolloutBuffer(gamma=1.0, lam=0.95)
 
@@ -413,7 +433,7 @@ def train_b(
 
     with train_log.open("w", newline="", encoding="utf-8") as train_handle, \
             evaluation_log.open("w", newline="", encoding="utf-8") as eval_handle:
-        train_writer = csv.DictWriter(train_handle, fieldnames=TRAIN_FIELDS)
+        train_writer = csv.DictWriter(train_handle, fieldnames=TRAIN_FIELDS_B)
         evaluation_writer = csv.DictWriter(
             eval_handle, fieldnames=EVALUATION_FIELDS
         )

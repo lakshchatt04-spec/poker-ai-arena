@@ -61,10 +61,16 @@ class HistoryTransition:
 
 @dataclass(frozen=True)
 class HistoryTrajectory:
-    """One player's decisions in one hand, plus what the hand paid them."""
+    """One player's decisions in one hand, plus what the hand paid them.
+
+    ``coin`` is the opponent's private coin for this hand when the trajectory was
+    played against ``CoinOpenerBettor``, and ``None`` otherwise.  It is a
+    per-hand label, so one value covers every decision in the trajectory.
+    """
 
     transitions: tuple[HistoryTransition, ...]
     final_payoff: float
+    coin: int | None = None
 
     def __len__(self) -> int:
         return len(self.transitions)
@@ -94,6 +100,8 @@ class HistoryRolloutBatch:
     values: np.ndarray  # (N,) float32
     advantages: np.ndarray  # (N,) float32, raw (not normalised)
     returns: np.ndarray  # (N,) float32
+    #: ``(N,)`` int64 coin labels, ``-1`` where no label exists (self-play).
+    coin_labels: np.ndarray | None = None
 
     def __len__(self) -> int:
         return int(self.actions.shape[0])
@@ -137,6 +145,10 @@ class HistoryRolloutBuffer:
         if not np.isfinite(float(trajectory.final_payoff)):
             raise ValueError(
                 f"final_payoff must be finite, got {trajectory.final_payoff!r}"
+            )
+        if trajectory.coin is not None and int(trajectory.coin) not in (0, 1):
+            raise ValueError(
+                f"coin must be 0, 1 or None, got {trajectory.coin!r}"
             )
 
         for index, transition in enumerate(trajectory.transitions):
@@ -236,6 +248,12 @@ class HistoryRolloutBuffer:
             [traj.values() for traj in self._trajectories]
         ).astype(np.float32)
 
+        coin_parts = [
+            np.full(len(traj), -1 if traj.coin is None else int(traj.coin),
+                    dtype=np.int64)
+            for traj in self._trajectories
+        ]
+
         advantage_parts: list[np.ndarray] = []
         return_parts: list[np.ndarray] = []
         for trajectory in self._trajectories:
@@ -258,6 +276,7 @@ class HistoryRolloutBuffer:
             values=values,
             advantages=np.concatenate(advantage_parts),
             returns=np.concatenate(return_parts),
+            coin_labels=np.concatenate(coin_parts),
         )
 
     def clear(self) -> None:
@@ -307,8 +326,15 @@ def collect_history_trajectories(
             small_blind = small_blind_player(state)
             tracker = HistoryTracker()
             tracker.start_hand(state)
+            coin_label: int | None = None
             if opponent is not None:
                 notify_hand_start(opponent, state)
+                # ``CoinOpenerBettor`` draws its coin in ``start_hand``, so read
+                # it after the notification.  Other opponents have no ``coin``
+                # attribute and leave the label unset.
+                coin = getattr(opponent, "coin", None)
+                if coin is not None:
+                    coin_label = int(bool(coin))
 
             while not env.is_over():
                 sequence = tracker.tokens(viewer=player_id)
@@ -346,6 +372,7 @@ def collect_history_trajectories(
                         HistoryTrajectory(
                             transitions=tuple(transitions),
                             final_payoff=float(payoffs[player]),
+                            coin=coin_label,
                         )
                     )
     finally:

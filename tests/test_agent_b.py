@@ -19,6 +19,9 @@ from poker_arena.environment import make_environment
 from poker_arena.history import MAX_HISTORY_TOKENS, TOKEN_DIM, HistoryTracker
 from poker_arena.networks import MASKED_LOGIT, NUM_ACTIONS, PolicyValueNet
 from poker_arena.networks_b import HISTORY_HIDDEN, HistoryPolicyValueNet
+from poker_arena.opponents import CoinOpenerBettor
+from poker_arena.ppo import PPOConfig
+from poker_arena.ppo_b import HistoryPPOUpdater
 from poker_arena.rollout import compute_gae
 from poker_arena.rollout_b import (
     HistoryRolloutBuffer,
@@ -39,6 +42,8 @@ from poker_arena.training_b import (
 
 EXPECTED_B_PARAMETERS = 116_933
 EXPECTED_A_PARAMETERS = 100_869
+#: One ``Linear(64, 1)``: 64 weights and one bias.
+EXPECTED_AUX_PARAMETERS = 65
 
 
 # -- fixtures and helpers ---------------------------------------------------
@@ -289,6 +294,114 @@ def test_history_changes_the_policy():
 
     assert not torch.allclose(with_logits, without_logits)
     assert (with_logits - without_logits).abs().max() > 1e-6
+
+
+# -- auxiliary coin head ----------------------------------------------------
+def test_aux_head_is_off_by_default_and_rejects_the_extra_call():
+    net = _net()
+    assert net.aux_coin is False
+    assert net.count_parameters() == EXPECTED_B_PARAMETERS
+    features = torch.zeros(1, FEATURE_DIM)
+    legal = torch.ones(1, NUM_ACTIONS, dtype=torch.bool)
+    tokens, history = _empty_history(1)
+    with pytest.raises(ValueError, match="aux_coin"):
+        net.forward_with_aux(features, tokens, history, legal)
+
+
+def test_aux_head_adds_one_linear_layer_and_returns_logits(env, encoder):
+    torch.manual_seed(0)
+    net = HistoryPolicyValueNet(aux_coin=True)
+    features, tokens, history, legal = _real_batch(env, encoder)
+
+    logits, value, aux = net.forward_with_aux(features, tokens, history, legal)
+
+    assert net.count_parameters() == EXPECTED_B_PARAMETERS + EXPECTED_AUX_PARAMETERS
+    assert logits.shape == (len(features), NUM_ACTIONS)
+    assert value.shape == (len(features),)
+    assert aux.shape == (len(features),)
+    assert torch.isfinite(aux).all()
+    assert "aux_head.weight" in net.state_dict()
+
+
+def test_aux_head_reads_the_memory_and_not_the_observation(env, encoder):
+    torch.manual_seed(0)
+    net = HistoryPolicyValueNet(aux_coin=True)
+    features = torch.zeros(2, FEATURE_DIM)
+    legal = torch.ones(2, NUM_ACTIONS, dtype=torch.bool)
+    tokens, history = _empty_history(2)
+    tokens[0, 0, 0] = 1.0
+    tokens[1, 0, 1] = 1.0
+    history[0, 0] = True
+    history[1, 0] = True
+
+    with torch.no_grad():
+        _, _, on = net.forward_with_aux(features, tokens, history, legal)
+        _, _, off = net.forward_with_aux(
+            features, tokens, history, legal, use_history=False
+        )
+
+    # Different token streams give different aux logits...
+    assert abs(float(on[0] - on[1])) > 1e-6
+    # ...but with the channel zeroed the head sees the same vector for both
+    # rows, so it cannot tell them apart.  That is the control arm's guarantee.
+    assert torch.equal(off[0], off[1])
+
+
+def test_aux_labels_flow_from_the_opponent_into_the_batch(env, encoder):
+    net = _net()
+    opponent = CoinOpenerBettor(seed=7)
+    trajectories = collect_history_trajectories(
+        env,
+        encoder,
+        net,
+        hands=8,
+        rng=np.random.default_rng(0),
+        opponent=opponent,
+    )
+    assert trajectories
+    assert all(trajectory.coin in (0, 1) for trajectory in trajectories)
+
+    self_play = collect_history_trajectories(
+        env, encoder, net, hands=2, rng=np.random.default_rng(0)
+    )
+    assert self_play
+    assert all(trajectory.coin is None for trajectory in self_play)
+
+    buffer = HistoryRolloutBuffer()
+    for trajectory in trajectories:
+        buffer.add_trajectory(trajectory)
+    batch = buffer.batch()
+    assert batch.coin_labels.shape == (len(batch),)
+    assert (batch.coin_labels >= 0).all()
+    assert set(np.unique(batch.coin_labels)).issubset({0, 1})
+
+
+def test_aux_update_masks_unlabelled_rows():
+    torch.manual_seed(0)
+    net = HistoryPolicyValueNet(aux_coin=True)
+
+    labelled = HistoryTrajectory(
+        transitions=(_transition(0, 0.0), _transition(3, 0.0)),
+        final_payoff=1.0,
+        coin=1,
+    )
+    self_play = HistoryTrajectory(
+        transitions=(_transition(0, 0.0),), final_payoff=-1.0, coin=None
+    )
+    buffer = HistoryRolloutBuffer()
+    buffer.add_trajectory(labelled)
+    buffer.add_trajectory(self_play)
+    batch = buffer.batch()
+
+    assert batch.coin_labels.tolist() == [1, 1, -1]
+
+    stats = HistoryPPOUpdater(
+        net, PPOConfig(epochs=1, minibatch_size=8), seed=0
+    ).step(batch)
+
+    assert np.isfinite(stats["aux_loss"])
+    assert 0.0 <= stats["aux_accuracy"] <= 1.0
+    assert stats["aux_loss"] > 0.0
 
 
 # -- rollout ----------------------------------------------------------------
@@ -567,6 +680,22 @@ def test_checkpoint_round_trip(tmp_path, encoder):
         assert torch.equal(parameter, loaded.state_dict()[name])
 
 
+def test_aux_checkpoint_round_trip(tmp_path):
+    torch.manual_seed(0)
+    net = HistoryPolicyValueNet(aux_coin=True)
+    config = _tiny_config(tmp_path, aux_coin=True)
+    path = tmp_path / "agent_b_aux.pt"
+
+    saved = save_checkpoint_b(net, config, 100, path)
+    loaded, metadata = load_checkpoint_b(saved)
+
+    assert metadata["aux_coin"] is True
+    assert loaded.aux_coin is True
+    assert "aux_head.weight" in loaded.state_dict()
+    for name, parameter in net.state_dict().items():
+        assert torch.equal(parameter, loaded.state_dict()[name])
+
+
 def test_training_config_b_validates_history_width(tmp_path):
     with pytest.raises(ValueError, match="history_hidden"):
         _tiny_config(tmp_path, history_hidden=0)
@@ -621,3 +750,14 @@ def test_train_b_control_arm_runs(tmp_path, encoder):
 
     assert len(result.iterations) == 2
     assert all(np.isfinite(row["value_loss"]) for row in result.iterations)
+
+
+def test_train_b_aux_arm_logs_aux_diagnostics(tmp_path):
+    config = _tiny_config(tmp_path, aux_coin=True, run_name="aux")
+
+    result = train_b(config)
+
+    assert len(result.iterations) == 2
+    assert all("aux_loss" in row for row in result.iterations)
+    assert all(np.isfinite(row["aux_loss"]) for row in result.iterations)
+    assert all(0.0 <= row["aux_accuracy"] <= 1.0 for row in result.iterations)
