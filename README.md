@@ -1,25 +1,44 @@
 # Poker AI Arena
 
-Heads-up Limit Texas Hold'em as a controlled testbed for reinforcement learning.
+Heads-up Limit Texas Hold'em as a hands-on playground for learning neural
+network architectures.
 
-An end-to-end PPO implementation — no RL framework — built to answer one
-falsifiable question with counted evidence instead of anecdote: **does a
-recurrent memory of the opponent's actions help a reinforcement-learning agent
-at poker?**
+One small game, four legal actions, and a shared training harness. What changes
+from agent to agent is the **model that reads the game**: a flat MLP, a GRU over
+the betting sequence, and — next on the roadmap — a graph neural network and a
+convolutional card encoder. The goal is to build a working intuition for which
+network suits which kind of data (grid, sequence, graph, set, continuum) and to
+carry that intuition into other work, especially computational physics and
+research.
+
+The PPO trainer is written from scratch, with no RL framework. The long research
+log further down this README is the history of how the harness was built and
+validated; keep it as an example of how to compare models honestly, but start
+with [AI types: what's here and what's next](#ai-types-whats-here-and-whats-next)
+if you are here to learn the architectures.
 
 ## At a glance
 
 | | |
 |---|---|
-| **What it is** | RLCard environment → 131-feature observation encoder → PPO trainer → paired, fixed-deal evaluation harness, with two agents and a capacity-matched control |
-| **Agents** | **A:** 100,869-parameter MLP over the current state. **B:** 116,933-parameter MLP + GRU over the betting history (116,998 with the optional auxiliary head) |
-| **Headline result** | Against a bot whose play depends on history the observation cannot recover, memory is worth **`+0.236` bb/hand** over the capacity-matched control — but a within-checkpoint ablation and a clairvoyance ceiling show the converged policy captures only **~2 %** of the information's value. A supervised coin head recovers the coin from the memory at AUC `0.99` yet leaves the paired payoff unchanged |
+| **What it is** | RLCard environment → 131-feature encoder → swappable model → from-scratch PPO trainer → paired, fixed-deal evaluation. One game, many architectures |
+| **Models** | **A (built):** 100,869-parameter MLP. **B (built):** 116,933-parameter MLP + GRU over the betting history. **G (next):** graph neural network. **C (planned):** CNN card encoder |
+| **Why it exists** | Learn what each architecture actually does by training it here and inspecting its behaviour, then reuse the idea on grids, graphs and sequences in physics |
+| **Historical result** | The original research question was about memory: against a history-dependent bot it was worth `+0.236` bb/hand at training time, but a within-checkpoint ablation and a clairvoyance ceiling showed the converged policy captured only ~2 % of the information's value |
 | **Stack** | Python 3.14, PyTorch, NumPy, RLCard, matplotlib; pytest for the suite |
-| **Scale** | ~13,300 lines across 47 Python modules · 45 training runs · three seeds per arm · 2,000 paired deals per comparison cell |
-| **Tests** | `301 passed` — simulator contract, encoder bounds, action masking, GAE identities, PPO invariants, checkpoint round-trips, bit-reproducibility |
+| **Scale** | ~13,300 lines across 47 Python modules · 45 historical training runs · three seeds per arm · 2,000 paired deals per comparison cell |
+| **Tests** | Simulator contract, encoder bounds, action masking, GAE identities, PPO invariants, checkpoint round-trips, bit-reproducibility |
 
 ## What this demonstrates
 
+* **Architecture comparison as a learning tool.** Every model reads the same
+  encoded state and faces the same opponents, so swapping only the network shows
+  what recurrence, message passing or convolution actually buys you.
+* **A transferable mental model.** For each new architecture, ask what structure
+  its input has (grid, sequence, graph, set), what symmetry its output should
+  respect, what it adds over a plain MLP, and how you would prove it learned the
+  intended thing. Those are the same questions you will ask choosing a model for
+  a PDE, a molecular graph or a time series.
 * **Deep RL from scratch.** Clipped PPO with GAE, advantage and return
   normalisation, entropy control and gradient-norm clipping, written directly
   against the algorithm rather than through an RL library.
@@ -37,24 +56,129 @@ at poker?**
 
 ## Reading paths
 
-* **60 seconds:** this section and [Results in brief](#results-in-brief).
+* **60 seconds:** this section and
+  [AI types: what's here and what's next](#ai-types-whats-here-and-whats-next).
+* **Learning the models:** [How the GNN will read a hand](#how-the-gnn-will-read-a-hand),
+  [How the CNN card encoder will read a hand](#how-the-cnn-card-encoder-will-read-a-hand),
+  and [Adding a new AI type](#adding-a-new-ai-type).
 * **Engineering:** [Setup](#setup), [PPO update](#ppo-update),
   [Known pitfalls](#known-pitfalls).
-* **Research:** [Stage 3c: a private coin](#stage-3c-a-private-coin) and
+* **Historical research:** [Results in brief](#results-in-brief),
+  [Stage 3c: a private coin](#stage-3c-a-private-coin), and
   [what perfect knowledge of the coin would have been worth](#what-perfect-knowledge-of-the-coin-would-have-been-worth).
 
-Two agents are trained with PPO and compared:
+Every model is trained with the same PPO loop and compared on the same deals:
 
-| | Agent A | Agent B |
-|---|---|---|
-| Network | feed-forward MLP | MLP + GRU |
-| Input | current observable state | current observable state **+ betting history** |
-| Question | baseline | does memory of opponent actions help? |
+| | Agent A | Agent B | Agent G (next) | Agent C (planned) |
+|---|---|---|---|---|
+| Network | feed-forward MLP | MLP + GRU | MLP + message-passing GNN | MLP + CNN over a card grid |
+| Input | current observable state | state **+ action sequence** | state **+ action graph** | state **+ rank × suit image** |
+| Idea it teaches | baseline | recurrence, gated memory | relations, permutation equivariance | locality, weight sharing, equivariance |
 
-**Research question:** *Does recurrent memory of opponent actions improve
-reinforcement-learning performance in heads-up poker?*
+**Learning goal:** understand what each architecture adds over the MLP baseline
+and where that idea transfers — CNNs to fields on grids, GNNs to molecules and
+meshes, transformers to trajectories, VAEs to reduced-order models, neural ODEs
+and PINNs to dynamical systems and PDEs.
+
+## AI types: what's here and what's next
+
+This arena is organised around **model families**, not around beating poker bots.
+Each row below is a different answer to the same question: *what structure does
+this input have, and what network respects that structure?*  The poker game is
+just a small, fast problem on which to test the answer.
+
+### The four questions to ask about any new model
+
+1. **Input structure** — grid, sequence, graph, set, or continuum?
+2. **Symmetry** — what must not change the answer (node order, image translation,
+   rotation of a molecule)?
+3. **Inductive bias** — what does this model assume that an MLP does not, and
+   what does that cost in data and compute?
+4. **Evidence** — what would you inspect to know it learned the intended thing
+   (filters, attention weights, message routes, latent space, ablation)?
+
+### Model roadmap
+
+| Model | Status | Structure it reads | What it teaches | Where the idea shows up in computational physics |
+|---|---|---|---|---|
+| MLP (Agent A) | ✅ built | flat 131-number vector | nonlinear function approximation; the baseline everything is compared against | quick surrogate regressions, feature-based baselines |
+| MLP + GRU (Agent B) | ✅ built | ordered action tokens | recurrence, gated memory, why order matters | simulation time series, trajectory models, system identification |
+| **GNN (Agent G)** | 📝 **next** | action graph with typed nodes and edges | message passing, permutation equivariance, learning which relations matter | molecules, CFD meshes, particle interactions, crystal and lattice graphs |
+| **CNN card encoder (Agent C)** | 📝 planned | 4 × 13 rank × suit image with hole/board channels | local filters, weight sharing, translation equivariance | fields on grids, PDE snapshots, detector images, lattice configurations |
+| Transformer | ⬜ later | token sequence with self-attention | attention as learned context weighting; positional encoding | long simulation sequences, operator learning, scientific foundation models |
+| Autoencoder / VAE | ⬜ later | distribution over states | latent space, reconstruction, variational inference | reduced-order models, latent dynamics, anomaly detection, sampling configurations |
+| Normalizing flows | ⬜ later | invertible transformations | change of variables, exact likelihood and generation | statistical mechanics, lattice field sampling, posterior densities |
+| Mixture of experts | ⬜ optional | conditionally routed inputs | learned specialisation, routing | multi-regime surrogates, multiphysics models |
+| Neural ODE | ⬜ standalone demo | continuous-time trajectory | learned dynamics, adjoint method, integration inside the model | system identification, learned terms in differential equations |
+| PINN | ⬜ standalone demo | PDE residual + boundary conditions | physics as the loss instead of labels | solving PDEs with sparse data |
+| Neural operator (FNO / DeepONet) | ⬜ standalone demo | function → function | resolution-independent surrogate models | fast PDE solvers, parameter-to-solution maps |
+
+The last three are better learned as tiny standalone demos than forced into a
+poker hand: a damped pendulum, 1-D Burgers/Poisson, and a 1-D solution operator.
+Use poker for the models whose input structure poker actually has (sequence,
+graph, grid).
+
+### How the GNN will read a hand
+
+A GRU sees the actions as a line. A graph network sees them as a set of
+relationships. The planned agent builds one small graph per decision:
+
+```text
+  action[0] ──┐                  ┌── street[preflop] ──┐
+  action[1] ──┼── same street ───┤                     │
+  action[2] ──┘                  └── street[flop]    ──┤
+       │                                               ├──> decision
+       └────────────── same actor ───> actor[P0] ───────┘
+                                       actor[P1] ───────┘
+```
+
+* **Nodes:** one per real action, four street nodes, two actor nodes, and one
+  decision node whose final vector feeds the policy and value heads.
+* **Edges:** action → street and action → actor (labelled with the action's
+  recency), then street → decision and actor → decision.
+* **Message passing:** each layer lets a node add up transformed messages from
+  its incoming neighbours. In symbols,
+  `h_i' = h_i + update(sum over j→i of message(h_j, edge_ji))`.
+  The sum is order-independent, which is the permutation equivariance that
+  makes the same code work on molecules and meshes.
+* **No graph library needed.** With PyTorch's `index_add_`, the aggregation is
+  a few lines, so the mechanism stays visible instead of being hidden behind a
+  framework.
+* **What to inspect:** print the edge list for a hand, compare the graph channel
+  against a control arm with it zeroed, and check whether the street route or
+  the actor route carries the useful information. That is the GNN equivalent of
+  the history-reliance probes already in `scripts/`.
+
+### How the CNN card encoder will read a hand
+
+Agent A's encoder flattens hole cards and board cards into 104 separate bits, so
+a rank like "queen" and its neighbour "king" are unrelated numbers to an MLP.
+The planned Agent C lays the cards out as a 4 × 13 rank-by-suit image with two
+input channels (your cards, the board) and runs convolutions over it. A filter
+can then learn local structure — connected ranks, suited runs — once and apply
+it everywhere. That is exactly the inductive bias you want when the real input
+is a field on a grid rather than a list of numbers. Compare it to the MLP at
+equal parameter count; the filters themselves are the thing to look at.
+
+### Adding a new AI type
+
+1. Add `networks_<name>.py` with `forward(features, tokens, history_mask,
+   legal_mask) -> (masked logits, value)`. The existing rollout and PPO updater
+   only need that signature, so they can be reused unchanged.
+2. Add a greedy policy wrapper so evaluation and paired comparison can play it.
+3. Give checkpoints an architecture-identifying key so `compare_agents.py` can
+   load old and new agents side by side.
+4. Add a thin CLI script in `scripts/`, a comparison mode if useful, and tests
+   that pin the new invariants (masking, padding, equivariance, ablation).
+5. Add a row to the model roadmap above, with the structure it reads and the
+   place you expect to reuse it.
 
 ## Results in brief
+
+The rest of this README is the **historical experiment log** that built and
+validated the harness. It is kept because the measurement discipline — paired
+deals, controls, probes and pre-registered checks — transfers directly to
+comparing new architectures.
 
 **Status: complete through the original five stages, plus the
 mixed-opening and private-coin follow-ups (roadmap rows 6-10), with a qualified
@@ -179,6 +303,12 @@ are no notebooks. An early exploratory notebook was removed from the repository;
 it is still recoverable from commit `f8a4a0a` if ever needed. The empty
 pre-existing `tets_poker/` folder is left on disk but is not tracked.
 
+Planned additions for the model-exploration roadmap (not on disk yet):
+`graph.py` (action-graph construction), `networks_gnn.py` (message passing plus
+policy/value heads), `networks_cnn.py` (card-grid encoder), `training_gnn.py`
+and `scripts/train_agent_gnn.py`, with matching tests. The roadmap table above
+is the plan, not a claim that these files already exist.
+
 ---
 
 ## Setup
@@ -284,13 +414,18 @@ python scripts\train_agent_a.py --iterations 3 --hands 64 `
 python scripts\train_agent_a.py --iterations 50 --hands 320
 ```
 
+The GNN and CNN training commands will be added here when those models land;
+until then the `Agent G (next)` and `Agent C (planned)` rows of the
+[model roadmap](#model-roadmap) describe the intended entry points.
+
 The environment smoke test ends with `All Stage 1 checks passed.`, the history
 smoke test with `All history-encoding checks passed.`, the encoder report with
 `All observation-encoder checks passed.`, the network report with
 `All network checks passed.`, the rollout report with
 `All rollout checks passed.`, the PPO report with `All PPO checks passed.`, the
-Agent B report with `All Agent B network checks passed.`, and the test suite
-currently reports `294 passed`.
+Agent B report with `All Agent B network checks passed.`. The pytest suite pins
+the invariants described in the sections below; run `python -m pytest -q` for
+the current count.
 
 `pytest.ini` limits collection to `tests/` because
 `scripts/test_environment.py` and `tests/test_environment.py` share a filename
@@ -2676,7 +2811,11 @@ memory.
 
 ---
 
-## Roadmap and recommended next milestone
+## Historical experiment log (stages 1-12)
+
+This table records the research programme that produced the harness. New model
+work is tracked in
+[AI types: what's here and what's next](#ai-types-whats-here-and-whats-next).
 
 | Stage | Work | Status |
 |---|---|---|
