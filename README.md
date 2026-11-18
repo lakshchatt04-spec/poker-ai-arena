@@ -7,7 +7,7 @@ One small game, four legal actions, and a shared training harness. What changes
 from agent to agent is the **model that reads the game**: a flat MLP, a GRU over
 the betting sequence, and — next on the roadmap — a graph neural network and a
 convolutional card encoder. The goal is to build a working intuition for which
-network suits which kind of data (grid, sequence, graph, set, continuum) and to
+network suits which kind of data (grid, sequence, graph, set) and to
 carry that intuition into other work, especially computational physics and
 research.
 
@@ -76,9 +76,9 @@ Every model is trained with the same PPO loop and compared on the same deals:
 | Idea it teaches | baseline | recurrence, gated memory | relations, permutation equivariance | locality, weight sharing, equivariance |
 
 **Learning goal:** understand what each architecture adds over the MLP baseline
-and where that idea transfers — CNNs to fields on grids, GNNs to molecules and
-meshes, transformers to trajectories, VAEs to reduced-order models, neural ODEs
-and PINNs to dynamical systems and PDEs.
+— recurrence for sequences, relations for graphs, locality for grids — and
+where those ideas transfer to other data, especially simulation fields and
+molecular structures.
 
 ## AI types: what's here and what's next
 
@@ -89,13 +89,13 @@ just a small, fast problem on which to test the answer.
 
 ### The four questions to ask about any new model
 
-1. **Input structure** — grid, sequence, graph, set, or continuum?
+1. **Input structure** — grid, sequence, graph, or set?
 2. **Symmetry** — what must not change the answer (node order, image translation,
    rotation of a molecule)?
 3. **Inductive bias** — what does this model assume that an MLP does not, and
    what does that cost in data and compute?
 4. **Evidence** — what would you inspect to know it learned the intended thing
-   (filters, attention weights, message routes, latent space, ablation)?
+   (filters, message routes, ablations)?
 
 ### Model roadmap
 
@@ -105,18 +105,9 @@ just a small, fast problem on which to test the answer.
 | MLP + GRU (Agent B) | ✅ built | ordered action tokens | recurrence, gated memory, why order matters | simulation time series, trajectory models, system identification |
 | **GNN (Agent G)** | 📝 **next** | action graph with typed nodes and edges | message passing, permutation equivariance, learning which relations matter | molecules, CFD meshes, particle interactions, crystal and lattice graphs |
 | **CNN card encoder (Agent C)** | 📝 planned | 4 × 13 rank × suit image with hole/board channels | local filters, weight sharing, translation equivariance | fields on grids, PDE snapshots, detector images, lattice configurations |
-| Transformer | ⬜ later | token sequence with self-attention | attention as learned context weighting; positional encoding | long simulation sequences, operator learning, scientific foundation models |
-| Autoencoder / VAE | ⬜ later | distribution over states | latent space, reconstruction, variational inference | reduced-order models, latent dynamics, anomaly detection, sampling configurations |
-| Normalizing flows | ⬜ later | invertible transformations | change of variables, exact likelihood and generation | statistical mechanics, lattice field sampling, posterior densities |
-| Mixture of experts | ⬜ optional | conditionally routed inputs | learned specialisation, routing | multi-regime surrogates, multiphysics models |
-| Neural ODE | ⬜ standalone demo | continuous-time trajectory | learned dynamics, adjoint method, integration inside the model | system identification, learned terms in differential equations |
-| PINN | ⬜ standalone demo | PDE residual + boundary conditions | physics as the loss instead of labels | solving PDEs with sparse data |
-| Neural operator (FNO / DeepONet) | ⬜ standalone demo | function → function | resolution-independent surrogate models | fast PDE solvers, parameter-to-solution maps |
 
-The last three are better learned as tiny standalone demos than forced into a
-poker hand: a damped pendulum, 1-D Burgers/Poisson, and a 1-D solution operator.
-Use poker for the models whose input structure poker actually has (sequence,
-graph, grid).
+Use poker for the models whose input structure poker actually has: sequence,
+graph, and grid.
 
 ### How the GNN will read a hand
 
